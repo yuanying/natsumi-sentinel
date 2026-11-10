@@ -8,6 +8,29 @@ natsumi-sentinel は、[natsumi](https://github.com/yuanying/natsumi) のイン�
 
 設計の判断は [docs/adr/](docs/adr/) にあります。
 
+## 作り方
+
+入口は `Makefile` です。`make help` でターゲットの一覧が出ます。必要なのは Go のツールチェーンだけで、lint と脆弱性の検査の道具は `go.mod` の `tool` から `go tool` で動きます。
+
+| コマンド | すること |
+|---|---|
+| `make help` | ターゲットの一覧を出す |
+| `make build` | `bin/sentinel` と `bin/authd` を作る |
+| `make test` | 単体テストを走らせる |
+| `make fmt-check vet lint tidy vuln` | CI と同じ検査をする |
+| `make dist` | 2 つのバイナリを linux/amd64・linux/arm64 の archive にして `dist/` に置く |
+
+どちらのバイナリも `--version` で版を出します。まだ中身は実装されておらず、ほかの起動のしかたではそう告げてエラーで終わります。
+
+image は 1 つの `Dockerfile` から、target を選んで作ります。
+
+| image | target | プログラム |
+|---|---|---|
+| `ghcr.io/yuanying/natsumi-sentinel` | `sentinel` | 関所 |
+| `ghcr.io/yuanying/natsumi-sentinel-authd` | `authd` | 鍵の番 |
+
+`vX.Y.Z` の tag を push すると、2 つの image が linux/amd64・linux/arm64 で ghcr.io に出て、GitHub Release ができます。
+
 ## License
 
 MIT
