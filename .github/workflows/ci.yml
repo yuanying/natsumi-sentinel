@@ -78,3 +78,23 @@ jobs:
         with:
           go-version-file: go.mod
       - run: make vuln
+
+  # Both images, on both architectures, without pushing. Renovate merges
+  # digest updates of the base images on its own, and without this a base
+  # that breaks the build would first show up in a release.
+  image:
+    name: image (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        target: [sentinel, authd]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: false
+          platforms: linux/amd64,linux/arm64
