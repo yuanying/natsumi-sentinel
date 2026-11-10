@@ -1,0 +1,9 @@
+# Only go.mod, go.sum, cmd/ and internal/ are copied into the build. Keeping
+# the rest out of the context keeps it small and keeps a local bin/ from
+# being sent at all.
+bin/
+dist/
+.git/
+.github/
+docs/
+*.md

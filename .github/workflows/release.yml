@@ -1,0 +1,115 @@
+# Releasing natsumi-sentinel
+#
+# Pushing a vX.Y.Z tag by hand releases that tag. weekly-release.yml calls
+# this with a version instead: a tag pushed with the run's GITHUB_TOKEN starts
+# no workflow, so the tag does not exist yet when this runs, and is pushed by
+# the last job, on the commit everything was built from (github.sha is the
+# same in every job of the run). A failed build leaves no tag behind.
+#
+# A release is two images on ghcr.io under the tag, built from one Dockerfile:
+#
+#   ghcr.io/<owner>/natsumi-sentinel        the gate (cmd/sentinel)
+#   ghcr.io/<owner>/natsumi-sentinel-authd  the key keeper (cmd/authd)
+#
+# The GitHub Release carries the notes and no archives. Both programs only
+# run as containers next to the workspace they guard, so a binary outside an
+# image has no use; `make dist` stays for cross-building by hand.
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_call:
+    inputs:
+      version:
+        description: The version to release (v1.2.3). The tag does not exist yet.
+        type: string
+        required: true
+      message:
+        description: The annotation of the tag.
+        type: string
+        required: true
+
+permissions: {}
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  test:
+    name: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # A weekly release is made from commits nobody looked at, so the tests
+      # run once more on exactly what is released, before any image is
+      # pushed under the version.
+      - run: make test
+
+  image:
+    name: image (${{ matrix.target }})
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - target: sentinel
+            image: ${{ github.repository }}
+          - target: authd
+            image: ${{ github.repository }}-authd
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: true
+          # The Dockerfile cross-compiles on the builder's platform, so the
+          # second architecture costs a compile, not an emulated build.
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ matrix.image }}:${{ env.VERSION }}
+          build-args: VERSION=${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+
+  release:
+    name: GitHub Release
+    needs: [image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # An annotated tag, as the tags pushed by hand are.
+      - name: Push the tag
+        if: inputs.version != ''
+        env:
+          MESSAGE: ${{ inputs.message }}
+        run: |
+          object="$(gh api "repos/${GH_REPO}/git/tags" -f tag="${VERSION}" -f message="${MESSAGE}" \
+            -f object="${GITHUB_SHA}" -f type=commit \
+            -f 'tagger[name]=github-actions[bot]' \
+            -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com' --jq .sha)"
+          gh api "repos/${GH_REPO}/git/refs" -f ref="refs/tags/${VERSION}" -f sha="${object}"
+      - run: gh release create "${VERSION}" --verify-tag --generate-notes
