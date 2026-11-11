@@ -18,6 +18,9 @@ type Rule struct {
 	Methods []string
 	// segments is the path pattern split at "/". Nil means any path.
 	segments []segment
+	// body are the fields of a JSON body the rule wants. A rule with
+	// any matches only a body read whole as one JSON object.
+	body []fieldPattern
 	// Target lists the parameters that make the operation's target, in
 	// order.
 	Target []string
@@ -43,8 +46,16 @@ type Match struct {
 	Target []string
 }
 
-// Match finds the first rule of d that matches method and path.
+// Match finds the first rule of d that matches method and path, without
+// a body.
 func (d Destination) Match(method, path string) (Match, bool) {
+	return d.MatchRequest(method, path, nil)
+}
+
+// MatchRequest finds the first rule of d that matches method, path and,
+// for a rule with body fields, body. body is nil when the request has no
+// body read whole as one JSON object.
+func (d Destination) MatchRequest(method, path string, body *Body) (Match, bool) {
 	for _, r := range d.Rules {
 		if len(r.Methods) > 0 && !slices.Contains(r.Methods, method) {
 			continue
@@ -53,9 +64,36 @@ func (d Destination) Match(method, path string) (Match, bool) {
 		if !ok {
 			continue
 		}
-		return Match{Operation: r.Operation, Params: params, Target: r.Target}, true
+		if len(r.body) > 0 {
+			if body == nil {
+				continue
+			}
+			more, ok := matchFields(r.body, body.Field)
+			if !ok {
+				continue
+			}
+			params = append(params, more...)
+		}
+		return Match{Operation: r.Operation, Params: d.NormalizeParams(params), Target: r.Target}, true
 	}
 	return Match{}, false
+}
+
+// NormalizeParams gives params in the form the destination compares them
+// in. On a GitHub destination, the owner and the repository are compared
+// without case, as GitHub does.
+func (d Destination) NormalizeParams(params []Param) []Param {
+	if d.GitHub == nil {
+		return params
+	}
+	out := make([]Param, len(params))
+	for i, p := range params {
+		if p.Name == "owner" || p.Name == "repo" {
+			p.Value = strings.ToLower(p.Value)
+		}
+		out[i] = p
+	}
+	return out
 }
 
 // ActionFor is what the table says to do with the operation named op: its
@@ -90,6 +128,9 @@ func (d Destination) RuleParams(op string) (params, target []string, ok bool) {
 				params = append(params, s.param)
 			}
 		}
+		for _, f := range r.body {
+			params = append(params, f.pattern.params()...)
+		}
 		return params, r.Target, true
 	}
 	return nil, nil, false
@@ -102,9 +143,14 @@ func (r Rule) matchPath(path string) ([]Param, bool) {
 	if !strings.HasPrefix(path, "/") {
 		return nil, false
 	}
-	parts := strings.Split(path[1:], "/")
+	return matchSegments(r.segments, strings.Split(path[1:], "/"))
+}
+
+// matchSegments matches parts one segment each, a rest segment taking the
+// rest.
+func matchSegments(segments []segment, parts []string) ([]Param, bool) {
 	var params []Param
-	for i, s := range r.segments {
+	for i, s := range segments {
 		if s.rest {
 			rest := strings.Join(parts[i:], "/")
 			if i >= len(parts) || rest == "" {
@@ -125,7 +171,7 @@ func (r Rule) matchPath(path string) ([]Param, bool) {
 			return nil, false
 		}
 	}
-	if len(parts) != len(r.segments) {
+	if len(parts) != len(segments) {
 		return nil, false
 	}
 	return params, true
@@ -137,10 +183,11 @@ var (
 )
 
 type rawRule struct {
-	Operation string   `yaml:"operation"`
-	Methods   []string `yaml:"methods"`
-	Path      string   `yaml:"path"`
-	Target    []string `yaml:"target"`
+	Operation string            `yaml:"operation"`
+	Methods   []string          `yaml:"methods"`
+	Path      string            `yaml:"path"`
+	Body      map[string]string `yaml:"body"`
+	Target    []string          `yaml:"target"`
 }
 
 func (rr rawRule) check() (Rule, error) {
@@ -179,12 +226,18 @@ func (rr rawRule) check() (Rule, error) {
 			r.segments = append(r.segments, s)
 		}
 	}
+	body, more, err := parseFields(rr.Body, params)
+	if err != nil {
+		return Rule{}, fmt.Errorf("body: %w", err)
+	}
+	r.body = body
+	params = append(params, more...)
 	if rr.Target == nil {
 		r.Target = params
 	} else {
 		for _, t := range rr.Target {
 			if !slices.Contains(params, t) {
-				return Rule{}, fmt.Errorf("target: %q is not a parameter of the path", t)
+				return Rule{}, fmt.Errorf("target: %q is not a parameter of the path or the body", t)
 			}
 		}
 		r.Target = rr.Target
