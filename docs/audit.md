@@ -58,6 +58,19 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 - `answer` の記録の `verdict` は、許した答えが `allow`、断った答えと取り消しが `deny` である。`name`・`operation`・`target`・`method`・`path` は、承認待ちの最初の中身か、取り消した許しのものを入れる。
 - `agent` の記録の `verdict` は `ask` で、`approval` に作った承認待ちの id が入る。
 
+## 名前解決の記録の理由
+
+名前解決の記録（`kind` が `dns`）の `reason` は、次のどれかである。断った問い合わせの理由は、どれも「not an open destination in the routing table」で始まる（分ける前の版の文で、それを探すものが引き続き見つけられるように）。
+
+| `reason` | `verdict` | いつ |
+|---|---|---|
+| `the gate's own name` | `allow` | 関所の固定の名前（`-gate-name`） |
+| `an open destination in the routing table` | `allow` | 振り分けで開く宛先の名前 |
+| `not an open destination in the routing table: the table denies the name` | `deny` | 振り分けで `treatment: deny` と書いた名前 |
+| `not an open destination in the routing table: the name is not in the table` | `deny` | 振り分けに無い名前 |
+
+- どちらの断りも、知らせの組（`denied-name`）の取り方は同じである（[知らせ](notices.md)）。1 日のまとめの「断ったもの」は理由ごとに行を分けるので、2 つは別の行になる。
+
 ## 要求の本文
 
 | 欄 | 中身 |

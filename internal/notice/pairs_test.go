@@ -69,6 +69,14 @@ func TestThePairsOfARecord(t *testing.T) {
 			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "made-up.example.net", Verdict: audit.Deny},
 			"[denied-name=made-up.example.net]",
 		},
+		"a name the table denies is the same pair as one not in the table": {
+			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "blocked.example.com", Verdict: audit.Deny, Reason: audit.ReasonDNSDenied},
+			"[denied-name=blocked.example.com]",
+		},
+		"a name not in the table, by its reason": {
+			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "made-up.example.net", Verdict: audit.Deny, Reason: audit.ReasonDNSNotListed},
+			"[denied-name=made-up.example.net]",
+		},
 		"a name answered is no pair": {
 			audit.Record{Kind: audit.KindDNS, Treatment: "open", Name: "api.example.com", Verdict: audit.Allow},
 			"[]",

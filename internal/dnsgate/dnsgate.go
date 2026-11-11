@@ -189,9 +189,13 @@ func (s *Server) resolve(ctx context.Context, rec *audit.Record, name string, ty
 		}
 		return dnsmessage.RCodeSuccess, nil
 	}
-	if !s.cfg.Routes().Resolvable(name) {
+	table := s.cfg.Routes()
+	if !table.Resolvable(name) {
 		rec.Treatment = string(routes.Closed)
-		rec.Verdict, rec.Reason = audit.Deny, "not an open destination in the routing table"
+		rec.Verdict, rec.Reason = audit.Deny, audit.ReasonDNSNotListed
+		if table.Listed(name) {
+			rec.Reason = audit.ReasonDNSDenied
+		}
 		return dnsmessage.RCodeNameError, nil
 	}
 	rec.Treatment = string(routes.Open)

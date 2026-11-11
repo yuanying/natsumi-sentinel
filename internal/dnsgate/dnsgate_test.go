@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -287,5 +288,33 @@ func TestQueriesAreAnsweredOverUDPAndTCP(t *testing.T) {
 		if got := aAnswers(parse(t, resp)); len(got) != 2 {
 			t.Errorf("over TCP: answers = %v", got)
 		}
+	}
+}
+
+func TestANameTheTableDeniesAndANameNotInTheTableAreToldApartByTheReason(t *testing.T) {
+	s, log := newServer(t)
+	s.Answer(context.Background(), query(t, "blocked.example.com.", dnsmessage.TypeA))
+	denied := log.last(t)
+	s.Answer(context.Background(), query(t, "unknown.example.com.", dnsmessage.TypeA))
+	unlisted := log.last(t)
+
+	if denied.Reason != audit.ReasonDNSDenied {
+		t.Errorf("the denied name's reason = %q, want %q", denied.Reason, audit.ReasonDNSDenied)
+	}
+	if unlisted.Reason != audit.ReasonDNSNotListed {
+		t.Errorf("the unlisted name's reason = %q, want %q", unlisted.Reason, audit.ReasonDNSNotListed)
+	}
+	if denied.Reason == unlisted.Reason {
+		t.Errorf("both reasons are %q", denied.Reason)
+	}
+	// What was said before stays at the head of both, so that what looks
+	// for it still finds it.
+	for _, r := range []string{denied.Reason, unlisted.Reason} {
+		if !strings.HasPrefix(r, "not an open destination in the routing table") {
+			t.Errorf("reason %q does not start as before", r)
+		}
+	}
+	if denied.Treatment != "deny" || unlisted.Treatment != "deny" {
+		t.Errorf("treatments = %q, %q, want deny for both", denied.Treatment, unlisted.Treatment)
 	}
 }
