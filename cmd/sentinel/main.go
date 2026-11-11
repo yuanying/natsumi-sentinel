@@ -34,6 +34,8 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/dnsgate"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
+	"github.com/yuanying/natsumi-sentinel/internal/metrics"
+	"github.com/yuanying/natsumi-sentinel/internal/observe"
 	"github.com/yuanying/natsumi-sentinel/internal/origdst"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
@@ -104,6 +106,7 @@ type options struct {
 	sources                   sourceFlag
 	gateName, gateAddress     string
 	reload                    time.Duration
+	metrics                   string
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -120,6 +123,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
+	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -193,15 +197,25 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	if err != nil {
 		return err
 	}
-	log, err := audit.Open(o.db, stdout)
+	db, err := audit.Open(o.db, stdout)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = log.Close() }()
+	defer func() { _ = db.Close() }()
 	upstream, err := newUpstream()
 	if err != nil {
 		return err
 	}
+
+	reg := metrics.NewRegistry(program, version)
+	var fixedNames []string
+	for name := range fixed {
+		fixedNames = append(fixedNames, name)
+	}
+	gm := observe.NewGateMetrics(reg, watcher.Current, fixedNames)
+	// Everything the gate records goes through log, so that the metrics
+	// see it.
+	log := observe.NewRecorder(db, gm.Observe)
 
 	var (
 		closers []func() error
@@ -213,6 +227,23 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		}
 		wg.Wait()
 	}()
+	if o.metrics != "" {
+		ml, err := net.Listen("tcp", o.metrics)
+		if err != nil {
+			return fmt.Errorf("the metrics: %w", err)
+		}
+		onListen("", "metrics", ml.Addr())
+		// Stopped with the rest, also when the start fails further on.
+		metricsCtx, stopMetrics := context.WithCancel(ctx)
+		closers = append(closers, func() error { stopMetrics(); return nil })
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := metrics.Serve(metricsCtx, ml, reg); err != nil {
+				logger.Error("serving the metrics stopped", "error", err)
+			}
+		}()
+	}
 	for _, src := range o.sources {
 		g := gate.New(gate.Config{
 			Source:      src.name,
@@ -220,7 +251,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			Decider:     decide.Defaults{},
 			Minter:      minter,
 			Log:         log,
-			Upstream:    upstream,
+			Upstream:    gm.Upstream(upstream),
 			OriginalDst: origdst.Lookup,
 			Logger:      logger.With("source", src.name),
 		})
@@ -266,7 +297,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	}()
 	go func() {
 		defer wg.Done()
-		audit.RunPruner(ctx, log, 24*time.Hour,
+		audit.RunPruner(ctx, db, 24*time.Hour,
 			func() time.Duration { return watcher.Current().Audit().Retention },
 			func(n int64, err error) {
 				if err != nil {
@@ -284,7 +315,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 
 // recordReload records the routing table being read again, or failing to
 // be, so that a table that did not take is in the record (docs/adr/0004).
-func recordReload(log *audit.Log, logger *slog.Logger, err error) {
+func recordReload(log observe.Log, logger *slog.Logger, err error) {
 	rec := &audit.Record{Time: time.Now(), Kind: audit.KindConfig}
 	if err != nil {
 		rec.Verdict = audit.Deny

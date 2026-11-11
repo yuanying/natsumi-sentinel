@@ -41,6 +41,8 @@ const (
 	KindDNS Kind = "dns"
 	// KindConfig is the gate reading its routing table again.
 	KindConfig Kind = "config"
+	// KindGate is a request the gate itself sent upstream (a notice).
+	KindGate Kind = "gate"
 )
 
 // Verdict is how the gate decided.
