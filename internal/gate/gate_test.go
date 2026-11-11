@@ -181,6 +181,7 @@ func newEnv(t *testing.T, passthroughPort int) *env {
 	e := &env{t: t, ca: ca, log: newMemLog(), origDst: netip.MustParseAddrPort("192.0.2.10:443")}
 	e.upstream = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(gate.MarkHeader, "forged")
+		w.Header().Set(gate.ApprovalHeader, "forged")
 		w.Header().Set("X-Upstream", "yes")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, "from upstream")
@@ -215,6 +216,7 @@ func newEnv(t *testing.T, passthroughPort int) *env {
 			return e.origDst, nil
 		},
 		FirstByteTimeout: time.Second,
+		StatusURL:        "http://sentinel.internal/v1/status",
 	})
 	go func() { _ = g.Serve(ln) }()
 	t.Cleanup(func() { _ = g.Close() })
@@ -230,7 +232,7 @@ func (e *env) decide(ctx context.Context, r decide.Request) decide.Decision {
 	d := e.decider
 	e.mu.Unlock()
 	if d == nil {
-		d = decide.Defaults{}
+		d = decide.Table{}
 	}
 	return d.Decide(ctx, r)
 }
@@ -283,8 +285,10 @@ func TestAnAllowedRequestIsHandedOnByNameWithItsKeyAndTheAnswerComesBack(t *test
 	if resp.Header.Get("X-Upstream") != "yes" {
 		t.Error("the upstream's headers did not come back")
 	}
-	if got := resp.Header.Get(gate.MarkHeader); got != "" {
-		t.Errorf("the upstream's %s: %q came back; it must be removed", gate.MarkHeader, got)
+	for _, h := range []string{gate.MarkHeader, gate.ApprovalHeader} {
+		if got := resp.Header.Get(h); got != "" {
+			t.Errorf("the upstream's %s: %q came back; it must be removed", h, got)
+		}
 	}
 
 	seen := e.up.requests()
@@ -373,6 +377,78 @@ func TestADeniedRequestIsAnsweredByTheGateWithItsMarkAndNotHandedOn(t *testing.T
 	}
 }
 
+func TestAnAskedRequestIsHeldWithTheGatesMarkAndTheApprovalAndNotHandedOn(t *testing.T) {
+	e := newEnv(t, 1)
+	e.mu.Lock()
+	e.decider = deciderFunc(func(context.Context, decide.Request) decide.Decision {
+		return decide.Decision{Verdict: audit.Ask, Reason: "asked", Operation: "pulls.merge", Target: "owner=o repo=r", Approval: "ap-1", ApprovalCreated: true}
+	})
+	e.mu.Unlock()
+	resp, err := e.client().Post("https://api.example.com/repos/o/r/pulls/5/merge", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || resp.Header.Get(gate.MarkHeader) != gate.MarkAsk {
+		t.Errorf("response = %d with mark %q, want 403 %s", resp.StatusCode, resp.Header.Get(gate.MarkHeader), gate.MarkAsk)
+	}
+	if got := resp.Header.Get(gate.ApprovalHeader); got != "ap-1" {
+		t.Errorf("%s = %q, want ap-1", gate.ApprovalHeader, got)
+	}
+	for _, want := range []string{"ap-1", "pulls.merge", "owner=o repo=r", "same request again", "http://sentinel.internal/v1/status"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("body = %q, want %q in it", body, want)
+		}
+	}
+	if n := len(e.up.requests()); n != 0 {
+		t.Errorf("upstream saw %d requests, want none", n)
+	}
+	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+	if rec.Verdict != audit.Ask || rec.Approval != "ap-1" || rec.Operation != "pulls.merge" || rec.Target != "owner=o repo=r" || rec.Status != 403 {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
+func TestARequestThatCouldNotBeDecidedIsRefusedAsTheGatesFailure(t *testing.T) {
+	e := newEnv(t, 1)
+	e.mu.Lock()
+	e.decider = deciderFunc(func(context.Context, decide.Request) decide.Decision {
+		return decide.Decision{Verdict: audit.Deny, Reason: "the ledger could not be read", Error: "disk I/O error"}
+	})
+	e.mu.Unlock()
+	resp, err := e.client().Get("https://api.example.com/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get(gate.MarkHeader) != gate.MarkError {
+		t.Errorf("response = %d with mark %q, want the gate's 503", resp.StatusCode, resp.Header.Get(gate.MarkHeader))
+	}
+	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+	if rec.Verdict != audit.Deny || rec.Error != "disk I/O error" {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
+func TestARequestLetThroughOnAGrantIsRecordedWithTheGrant(t *testing.T) {
+	e := newEnv(t, 1)
+	e.mu.Lock()
+	e.decider = deciderFunc(func(context.Context, decide.Request) decide.Decision {
+		return decide.Decision{Verdict: audit.Allow, Reason: "granted", Operation: "pulls.merge", Target: "owner=o repo=r", Grant: "gr-1"}
+	})
+	e.mu.Unlock()
+	resp, err := e.client().Get("https://api.example.com/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+	if rec.Verdict != audit.Allow || rec.Grant != "gr-1" || rec.Operation != "pulls.merge" || rec.Status != 201 {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
 func TestTheDeciderIsGivenTheFactsOfTheRequest(t *testing.T) {
 	e := newEnv(t, 1)
 	var got decide.Request
@@ -388,7 +464,8 @@ func TestTheDeciderIsGivenTheFactsOfTheRequest(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if got.Source != "workspace" || got.Destination.Name != "api.example.com" || got.Port != 443 ||
-		got.Method != "POST" || got.Path != "/p" || got.Query != "q=1" || string(got.Body) != "abc" || !got.BodyComplete {
+		got.Method != "POST" || got.Path != "/p" || got.Query != "q=1" || string(got.Body) != "abc" || !got.BodyComplete ||
+		got.BodySummary == nil || got.BodySummary.Text != "abc" || len(got.Settings.Durations) == 0 {
 		t.Errorf("Decider got %+v", got)
 	}
 	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })

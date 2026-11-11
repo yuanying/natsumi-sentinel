@@ -66,9 +66,11 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prefix := capture.Summary()
+	table := g.cfg.Routes()
 	decision := g.cfg.Decider.Decide(r.Context(), decide.Request{
 		Source:       g.cfg.Source,
 		Destination:  oc.dest,
+		Settings:     table.Approvals(),
 		Port:         oc.dst.Port(),
 		Method:       r.Method,
 		Path:         r.URL.Path,
@@ -76,9 +78,22 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		Header:       r.Header.Clone(),
 		Body:         capture.Prefix(),
 		BodyComplete: !prefix.Truncated,
+		BodySummary:  summary(capture),
 	})
 	rec.Reason = decision.Reason
-	if decision.Verdict != audit.Allow {
+	rec.Operation = decision.Operation
+	rec.Target = decision.Target
+	rec.Approval = decision.Approval
+	rec.Grant = decision.Grant
+	switch {
+	case decision.Error != "":
+		rec.Error = decision.Error
+		g.refuse(w, rec, http.StatusServiceUnavailable, MarkError, "the request was not sent: "+decision.Reason)
+		return
+	case decision.Verdict == audit.Ask:
+		g.ask(w, rec, decision)
+		return
+	case decision.Verdict != audit.Allow:
 		g.refuse(w, rec, http.StatusForbidden, MarkDeny, "denied: "+decision.Reason+". "+tableHint)
 		return
 	}
@@ -115,6 +130,7 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	removeHopByHop(h)
 	h.Del(MarkHeader)
+	h.Del(ApprovalHeader)
 	w.WriteHeader(resp.StatusCode)
 	rec.Status = resp.StatusCode
 	n, err := copyFlushing(w, resp.Body)
@@ -142,6 +158,29 @@ func upstreamFailure(rec *audit.Record, err error) string {
 	}
 	rec.Error = fmt.Sprintf("%s: %s: %s", what, ae.Reason, ae.Message)
 	return fmt.Sprintf("%s (%s): %s", what, ae.Reason, ae.Message)
+}
+
+// ask records a request held for the owner and answers it at once: the
+// connection is not kept open for the answer (docs/adr/0004).
+func (g *Gate) ask(w http.ResponseWriter, rec *audit.Record, d decide.Decision) {
+	rec.Verdict = audit.Ask
+	rec.Status = http.StatusForbidden
+	if err := g.cfg.Log.Write(context.Background(), rec); err != nil {
+		g.cfg.Logger.Error("a held request could not be recorded", "name", rec.Name, "error", err)
+	}
+	what := "a request no rule names"
+	if d.Operation != "" {
+		what = "the operation " + d.Operation
+		if d.Target != "" {
+			what += " (" + d.Target + ")"
+		}
+	}
+	text := fmt.Sprintf("held for the owner's answer as approval %s: %s. Once the owner allows it, make the same request again.", d.Approval, what)
+	if g.cfg.StatusURL != "" {
+		text += " Your approvals and grants are at " + g.cfg.StatusURL + "."
+	}
+	w.Header().Set(ApprovalHeader, d.Approval)
+	writeGate(w, http.StatusForbidden, MarkAsk, text)
 }
 
 // refuse records a request the gate answers itself and answers it.

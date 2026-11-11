@@ -217,7 +217,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		g := gate.New(gate.Config{
 			Source:      src.name,
 			Routes:      watcher.Current,
-			Decider:     decide.Defaults{},
+			Decider:     decide.Table{},
 			Minter:      minter,
 			Log:         log,
 			Upstream:    upstream,

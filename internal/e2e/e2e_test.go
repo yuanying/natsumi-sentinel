@@ -149,7 +149,7 @@ credentials:
 	g := gate.New(gate.Config{
 		Source:   "workspace",
 		Routes:   watcher.Current,
-		Decider:  decide.Defaults{},
+		Decider:  decide.Table{},
 		Minter:   minter,
 		Log:      w.log,
 		Upstream: tr,

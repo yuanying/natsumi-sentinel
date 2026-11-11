@@ -55,6 +55,9 @@ type Config struct {
 	// FirstByteTimeout is how long a connection may stay silent before
 	// the gate gives up on finding out what it is. Defaults to 10s.
 	FirstByteTimeout time.Duration
+	// StatusURL is where the workspace reads its approvals, told in the
+	// answer to an asked request. Empty leaves it out.
+	StatusURL string
 	// Logger is for what goes wrong in the gate itself, not for records.
 	Logger *slog.Logger
 	Now    func() time.Time
