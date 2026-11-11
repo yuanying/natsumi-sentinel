@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,6 +40,16 @@ destinations:
     operations:
       repos.delete: deny
       read: allow
+  - name: gh.example.com
+    treatment: open
+    default: ask
+    github: {}
+    rules:
+      - operation: pr.merge
+        methods: [PUT]
+        path: /repos/{owner}/{repo}/pulls/{number}/merge
+        body: {sha: "{sha}"}
+        target: [owner, repo, number]
   - name: closed.example.com
     treatment: deny
 approvals:
@@ -421,5 +432,23 @@ func TestAskingBeforehandThatCannotBeRecordedIsNotTaken(t *testing.T) {
 	code, _ := e.do(e.agent, "POST", "/v1/approvals", `{"items":[{"destination":"api.example.com","operation":"pulls.merge","params":{"owner":"o","repo":"r","number":"5"}}]}`)
 	if code != 503 {
 		t.Errorf("ask = %d, want 503", code)
+	}
+}
+
+func TestAMergeAskedForBeforehandOnGitHubTakesItsHeadSHAAndTheRepositoryWithoutCase(t *testing.T) {
+	e := newEnv(t)
+	code, out := e.do(e.agent, "POST", "/v1/approvals", `{"items":[
+		{"destination":"gh.example.com","operation":"pr.merge","params":{"owner":"Example","repo":"R","number":"5","sha":"abc"}}]}`)
+	if code != 201 {
+		t.Fatalf("ask = %d %v", code, out)
+	}
+	item := list(out["items"])[0].(map[string]any)
+	if item["targetText"] != "owner=example repo=r number=5" {
+		t.Errorf("item = %v", item)
+	}
+	code, out = e.do(e.agent, "POST", "/v1/approvals", `{"items":[
+		{"destination":"gh.example.com","operation":"pr.merge","params":{"owner":"o","repo":"r","number":"5"}}]}`)
+	if code != 400 || !strings.Contains(fmt.Sprint(out["error"]), "sha") {
+		t.Errorf("a merge without its SHA = %d %v", code, out)
 	}
 }

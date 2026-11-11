@@ -465,7 +465,7 @@ func itemFacts(table *routes.Table, it askItem) (ledger.Facts, error) {
 		}
 		params = append(params, routes.Param{Name: n, Value: v})
 	}
-	return ledger.Facts{Destination: d.Name, Operation: it.Operation, Params: params, Target: target}, nil
+	return ledger.Facts{Destination: d.Name, Operation: it.Operation, Params: d.NormalizeParams(params), Target: target}, nil
 }
 
 func notFound(w http.ResponseWriter, _ *http.Request) {
