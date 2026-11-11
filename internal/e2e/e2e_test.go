@@ -96,9 +96,27 @@ func newWorld(t *testing.T) *world {
 // answers what reaches it after it is kept.
 func newWorldWith(t *testing.T, table string, answer http.HandlerFunc) *world {
 	t.Helper()
+	return newWorldOpts(t, table, answer, worldOptions{})
+}
+
+// worldOptions change how a world is joined up. The zero value is the
+// usual world.
+type worldOptions struct {
+	// upstream is what the fake upstream listens on; nil is IPv4 loopback.
+	upstream net.Listener
+	// authdDial makes authd's dial, given the fake upstream's address.
+	// Nil dials the fake upstream whatever the name.
+	authdDial func(upstreamAddr string) func(ctx context.Context, network, addr string) (net.Conn, error)
+	// originalDst is where the gate is told each connection was going.
+	// Nil is 192.0.2.10:443.
+	originalDst func(net.Conn) (netip.AddrPort, error)
+}
+
+func newWorldOpts(t *testing.T, table string, answer http.HandlerFunc, opts worldOptions) *world {
+	t.Helper()
 	w := &world{t: t, ca: testca.New(t)}
 
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		r.Body = io.NopCloser(strings.NewReader(string(body)))
 		w.mu.Lock()
@@ -108,6 +126,11 @@ func newWorldWith(t *testing.T, table string, answer http.HandlerFunc) *world {
 		w.mu.Unlock()
 		answer(rw, r)
 	}))
+	if opts.upstream != nil {
+		_ = upstream.Listener.Close()
+		upstream.Listener = opts.upstream
+	}
+	upstream.StartTLS()
 	t.Cleanup(upstream.Close)
 
 	dir := t.TempDir()
@@ -136,12 +159,16 @@ credentials:
 		t.Fatal(err)
 	}
 	upstreamAddr := upstream.Listener.Addr().String()
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, upstreamAddr)
+	}
+	if opts.authdDial != nil {
+		dial = opts.authdDial(upstreamAddr)
+	}
 	handler, err := authd.NewHandler(cfg, authd.Options{
-		Logger: slog.New(slog.DiscardHandler),
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, upstreamAddr)
-		},
+		Logger:      slog.New(slog.DiscardHandler),
+		DialContext: dial,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -190,17 +217,20 @@ credentials:
 	w.owner = approvals.Owner(approvals.OwnerConfig{Ledger: w.ledger, Log: w.log})
 	w.agent = approvals.Agent(approvals.AgentConfig{Source: "workspace", Ledger: w.ledger, Log: w.log, Routes: watcher.Current})
 
-	g := gate.New(gate.Config{
-		Source:   "workspace",
-		Routes:   watcher.Current,
-		Decider:  decide.Table{Ledger: w.ledger, GitHub: &github.Connector{Transport: tr, Log: w.log}},
-		Minter:   minter,
-		Log:      w.log,
-		Upstream: tr,
-		OriginalDst: func(net.Conn) (netip.AddrPort, error) {
+	if opts.originalDst == nil {
+		opts.originalDst = func(net.Conn) (netip.AddrPort, error) {
 			return netip.MustParseAddrPort("192.0.2.10:443"), nil
-		},
-		Logger: slog.New(slog.DiscardHandler),
+		}
+	}
+	g := gate.New(gate.Config{
+		Source:      "workspace",
+		Routes:      watcher.Current,
+		Decider:     decide.Table{Ledger: w.ledger, GitHub: &github.Connector{Transport: tr, Log: w.log}},
+		Minter:      minter,
+		Log:         w.log,
+		Upstream:    tr,
+		OriginalDst: opts.originalDst,
+		Logger:      slog.New(slog.DiscardHandler),
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

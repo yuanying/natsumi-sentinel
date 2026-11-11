@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -47,17 +48,24 @@ func (m *memLog) last(t *testing.T) audit.Record {
 	return m.records[len(m.records)-1]
 }
 
+// fakeResolver holds each name's addresses, IPv4 and IPv6 together. A name
+// with none of the family asked for is not found, as with Go's resolver.
 type fakeResolver map[string][]netip.Addr
 
 func (f fakeResolver) LookupNetIP(_ context.Context, network, host string) ([]netip.Addr, error) {
-	if network != "ip4" {
-		return nil, errors.New("only ip4 is asked for")
+	if network != "ip4" && network != "ip6" {
+		return nil, errors.New("only ip4 or ip6 is asked for")
 	}
-	addrs, ok := f[host]
-	if !ok {
+	var out []netip.Addr
+	for _, a := range f[host] {
+		if a.Is4() == (network == "ip4") {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
 		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 	}
-	return addrs, nil
+	return out, nil
 }
 
 const table = `
@@ -73,6 +81,12 @@ destinations:
     default: allow
   - name: blocked.example.com
     treatment: deny
+  - name: v6only.example.com
+    treatment: open
+    default: allow
+  - name: dual.example.com
+    treatment: open
+    default: allow
 `
 
 func newServer(t *testing.T) (*dnsgate.Server, *memLog) {
@@ -81,6 +95,11 @@ func newServer(t *testing.T) (*dnsgate.Server, *memLog) {
 }
 
 func newServerWith(t *testing.T, suffixes []string) (*dnsgate.Server, *memLog) {
+	t.Helper()
+	return newServerFull(t, suffixes, false)
+}
+
+func newServerFull(t *testing.T, suffixes []string, ipv6 bool) (*dnsgate.Server, *memLog) {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "routes.yaml"), []byte(table), 0o600); err != nil {
@@ -91,7 +110,11 @@ func newServerWith(t *testing.T, suffixes []string) (*dnsgate.Server, *memLog) {
 		t.Fatal(err)
 	}
 	log := &memLog{}
-	res := fakeResolver{"api.example.com": {netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("198.51.100.8")}}
+	res := fakeResolver{
+		"api.example.com":    {netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("198.51.100.8")},
+		"v6only.example.com": {netip.MustParseAddr("2001:db8::7")},
+		"dual.example.com":   {netip.MustParseAddr("198.51.100.9"), netip.MustParseAddr("2001:db8::9")},
+	}
 	s := dnsgate.New(dnsgate.Config{
 		Source: "workspace",
 		Routes: w.Current,
@@ -104,6 +127,7 @@ func newServerWith(t *testing.T, suffixes []string) (*dnsgate.Server, *memLog) {
 		Fixed:          map[string]netip.Addr{"sentinel.internal": netip.MustParseAddr("127.0.0.1")},
 		Log:            log,
 		SearchSuffixes: suffixes,
+		IPv6:           ipv6,
 	})
 	return s, log
 }
@@ -375,5 +399,97 @@ func TestWithoutSearchSuffixesASuffixedNameIsNotListed(t *testing.T) {
 	s.Answer(context.Background(), query(t, "api.example.com.ns.svc.cluster.example.", dnsmessage.TypeA))
 	if rec := log.last(t); rec.Reason != audit.ReasonDNSNotListed {
 		t.Errorf("reason = %q, want %q", rec.Reason, audit.ReasonDNSNotListed)
+	}
+}
+
+func aaaaAnswers(m dnsmessage.Message) []netip.Addr {
+	var out []netip.Addr
+	for _, a := range m.Answers {
+		if r, ok := a.Body.(*dnsmessage.AAAAResource); ok {
+			out = append(out, netip.AddrFrom16(r.AAAA))
+		}
+	}
+	return out
+}
+
+func TestWithIPv6RedirectedAnOpenNameIsAnsweredWithItsRealIPv6Addresses(t *testing.T) {
+	for name, want := range map[string]string{
+		"v6only.example.com.": "[2001:db8::7]",
+		"dual.example.com.":   "[2001:db8::9]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, log := newServerFull(t, nil, true)
+			m := parse(t, s.Answer(context.Background(), query(t, name, dnsmessage.TypeAAAA)))
+			if m.RCode != dnsmessage.RCodeSuccess {
+				t.Fatalf("rcode = %v, want NOERROR", m.RCode)
+			}
+			if got := fmt.Sprint(aaaaAnswers(m)); got != want {
+				t.Errorf("AAAA answers = %s, want %s", got, want)
+			}
+			rec := log.last(t)
+			if rec.DNSType != "AAAA" || rec.Verdict != audit.Allow || fmt.Sprint(rec.DNSAnswer) != want {
+				t.Errorf("record = %+v", rec)
+			}
+		})
+	}
+}
+
+func TestWithIPv6RedirectedANameWithoutIPv4HasAnEmptyAnswerToA(t *testing.T) {
+	s, log := newServerFull(t, nil, true)
+	m := parse(t, s.Answer(context.Background(), query(t, "v6only.example.com.", dnsmessage.TypeA)))
+	if m.RCode != dnsmessage.RCodeSuccess || len(m.Answers) != 0 {
+		t.Errorf("answer = %v with %d records, want NOERROR and none: the name is there", m.RCode, len(m.Answers))
+	}
+	if rec := log.last(t); rec.DNSRcode != "NOERROR" {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
+func TestWithIPv6RedirectedANameWithoutIPv6HasAnEmptyAnswerToAAAA(t *testing.T) {
+	s, _ := newServerFull(t, nil, true)
+	m := parse(t, s.Answer(context.Background(), query(t, "api.example.com.", dnsmessage.TypeAAAA)))
+	if m.RCode != dnsmessage.RCodeSuccess || len(m.Answers) != 0 {
+		t.Errorf("answer = %v with %d records, want NOERROR and none", m.RCode, len(m.Answers))
+	}
+}
+
+func TestWithIPv6RedirectedANameWithNeitherIsNXDOMAINForBoth(t *testing.T) {
+	for _, typ := range []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
+		s, _ := newServerFull(t, nil, true)
+		m := parse(t, s.Answer(context.Background(), query(t, "gone.example.com.", typ)))
+		if m.RCode != dnsmessage.RCodeNameError {
+			t.Errorf("%v: rcode = %v, want NXDOMAIN", typ, m.RCode)
+		}
+	}
+}
+
+func TestWithIPv6RedirectedANameNotOpenedIsStillNXDOMAIN(t *testing.T) {
+	s, log := newServerFull(t, nil, true)
+	m := parse(t, s.Answer(context.Background(), query(t, "blocked.example.com.", dnsmessage.TypeAAAA)))
+	if m.RCode != dnsmessage.RCodeNameError || len(m.Answers) != 0 {
+		t.Errorf("answer = %v with %d records, want NXDOMAIN and none", m.RCode, len(m.Answers))
+	}
+	if rec := log.last(t); rec.Verdict != audit.Deny {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
+func TestWithoutIPv6RedirectedANameWithoutIPv4IsNXDOMAINAndAAAAIsNotAnswered(t *testing.T) {
+	s, _ := newServer(t)
+	m := parse(t, s.Answer(context.Background(), query(t, "v6only.example.com.", dnsmessage.TypeA)))
+	if m.RCode != dnsmessage.RCodeNameError {
+		t.Errorf("A: rcode = %v, want NXDOMAIN as before", m.RCode)
+	}
+	m = parse(t, s.Answer(context.Background(), query(t, "v6only.example.com.", dnsmessage.TypeAAAA)))
+	if m.RCode != dnsmessage.RCodeSuccess || len(m.Answers) != 0 {
+		t.Errorf("AAAA: answer = %v with %d records, want NOERROR and none", m.RCode, len(m.Answers))
+	}
+}
+
+func TestWithIPv6RedirectedTheGatesOwnNameHasNoIPv6Answer(t *testing.T) {
+	s, _ := newServerFull(t, nil, true)
+	m := parse(t, s.Answer(context.Background(), query(t, "sentinel.internal.", dnsmessage.TypeAAAA)))
+	if m.RCode != dnsmessage.RCodeSuccess || len(m.Answers) != 0 {
+		t.Errorf("answer = %v with %d records, want NOERROR and none", m.RCode, len(m.Answers))
 	}
 }

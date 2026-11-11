@@ -242,6 +242,9 @@ func parse(files []source) (*Table, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s: passthrough[%d]: cidr: %w", src.name, i, err)
 			}
+			if prefix.Addr().Is4In6() {
+				return nil, fmt.Errorf("%s: passthrough[%d]: cidr: write an IPv4 range as IPv4, not mapped into IPv6", src.name, i)
+			}
 			if len(p.Ports) == 0 {
 				return nil, fmt.Errorf("%s: passthrough[%d]: ports: at least one port is required", src.name, i)
 			}

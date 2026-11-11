@@ -97,6 +97,24 @@ func TestOnlyOpenDestinationsAreAnsweredInNameResolution(t *testing.T) {
 	}
 }
 
+func TestAnIPv6PassthroughIsDecidedByTheAddressRangeAndThePortAsIPv4Is(t *testing.T) {
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": basic + "  - cidr: 2001:db8:1::/48\n    ports: [22]\n"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for addr, want := range map[string]bool{
+		"[2001:db8:1::5]:22":      true,
+		"[2001:db8:1:ffff::1]:22": true,
+		"[2001:db8:1::5]:443":     false,
+		"[2001:db8:2::5]:22":      false,
+		"192.0.2.10:22":           true,
+	} {
+		if got := table.Passthrough(netip.MustParseAddrPort(addr)); got != want {
+			t.Errorf("Passthrough(%s) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
 func TestPassthroughIsDecidedByTheAddressRangeAndThePort(t *testing.T) {
 	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": basic}))
 	if err != nil {
@@ -191,6 +209,9 @@ func TestATableThatCannotBeUsedIsRefused(t *testing.T) {
 		"a port out of range":         {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: allow\n    ports: [70000]\n"},
 		"a range that is not a CIDR":  {"routes.yaml": "passthrough:\n  - cidr: 192.0.2.1\n    ports: [22]\n"},
 		"a passthrough without ports": {"routes.yaml": "passthrough:\n  - cidr: 192.0.2.0/24\n"},
+		// An IPv4 address is matched as IPv4, so a mapped range would
+		// never match anything.
+		"an IPv4-mapped IPv6 range": {"routes.yaml": "passthrough:\n  - cidr: ::ffff:192.0.2.0/120\n    ports: [22]\n"},
 		"audit settings given twice": {
 			"a.yaml": "audit:\n  retentionDays: 1\n",
 			"b.yaml": "audit:\n  retentionDays: 2\n",

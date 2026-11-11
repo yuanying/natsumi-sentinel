@@ -65,6 +65,10 @@ func TestThePairsOfARecord(t *testing.T) {
 			audit.Record{Kind: audit.KindPassthrough, Address: "192.0.2.10:5432", Verdict: audit.Allow},
 			"[passthrough=192.0.2.10:5432]",
 		},
+		"an IPv6 passthrough is its address and port": {
+			audit.Record{Kind: audit.KindPassthrough, Address: "[2001:db8::10]:22", Verdict: audit.Allow},
+			"[passthrough=[2001:db8::10]:22]",
+		},
 		"a name refused in name resolution": {
 			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "made-up.example.net", Verdict: audit.Deny},
 			"[denied-name=made-up.example.net]",

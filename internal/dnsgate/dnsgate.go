@@ -4,9 +4,11 @@
 // fixed names with the gate's address, and every other name with NXDOMAIN.
 // Every query is recorded (docs/adr/0006).
 //
-// Only A is answered. An AAAA query for a name that is answered gets
-// NOERROR with no records: IPv6 is not redirected to the gate in the first
-// version, so the workspace is to reach everything over IPv4.
+// A is answered always, and AAAA only for a source whose IPv6 is redirected
+// to the gate too (Config.IPv6): a real IPv6 address the workspace would
+// connect to straight out must not be handed out. Without it, an AAAA query
+// for a name that is answered gets NOERROR with no records, and the
+// workspace reaches everything over IPv4.
 package dnsgate
 
 import (
@@ -56,6 +58,10 @@ type Config struct {
 	// the table with one of them added is told by its own reason, which is
 	// not a notice's pair.
 	SearchSuffixes []string
+	// IPv6 is set when the source's IPv6 is redirected to the gate as its
+	// IPv4 is. Only then are open names answered in AAAA, with their real
+	// IPv6 addresses, and a name with no IPv4 address is told to be there.
+	IPv6 bool
 }
 
 // Server answers queries.
@@ -227,27 +233,58 @@ func (s *Server) resolve(ctx context.Context, rec *audit.Record, name string, ty
 	}
 	rec.Treatment = string(routes.Open)
 	rec.Verdict, rec.Reason = audit.Allow, "an open destination in the routing table"
-	if typ != dnsmessage.TypeA {
+	var network, other string
+	switch {
+	case typ == dnsmessage.TypeA:
+		network, other = "ip4", "ip6"
+	case typ == dnsmessage.TypeAAAA && s.cfg.IPv6:
+		network, other = "ip6", "ip4"
+	default:
 		return dnsmessage.RCodeSuccess, nil
 	}
+	addrs, rcode := s.lookup(ctx, rec, name, network)
+	if rcode != dnsmessage.RCodeNameError || !s.cfg.IPv6 {
+		return rcode, addrs
+	}
+	// The name may be there with addresses of the other family only: then
+	// it is NOERROR with no records, so that the resolver goes on to ask
+	// for the other.
+	found, rcode := s.lookup(ctx, rec, name, other)
+	switch {
+	case rcode == dnsmessage.RCodeSuccess && len(found) > 0:
+		return dnsmessage.RCodeSuccess, nil
+	case rcode == dnsmessage.RCodeServerFailure:
+		return rcode, nil
+	}
+	return dnsmessage.RCodeNameError, nil
+}
+
+// lookup asks the real DNS for name's addresses of one family ("ip4" or
+// "ip6"). A name not found is NXDOMAIN; any other failure is SERVFAIL, with
+// the error in the record.
+func (s *Server) lookup(ctx context.Context, rec *audit.Record, name, network string) ([]netip.Addr, dnsmessage.RCode) {
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
-	addrs, err := s.cfg.Resolver.LookupNetIP(ctx, "ip4", name)
+	addrs, err := s.cfg.Resolver.LookupNetIP(ctx, network, name)
 	if err != nil {
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-			return dnsmessage.RCodeNameError, nil
+			return nil, dnsmessage.RCodeNameError
 		}
 		rec.Error = err.Error()
-		return dnsmessage.RCodeServerFailure, nil
+		return nil, dnsmessage.RCodeServerFailure
 	}
 	out := make([]netip.Addr, 0, len(addrs))
 	for _, a := range addrs {
-		if a = a.Unmap(); a.Is4() {
+		if network == "ip4" {
+			if a = a.Unmap(); a.Is4() {
+				out = append(out, a)
+			}
+		} else if a.Is6() && !a.Is4In6() {
 			out = append(out, a)
 		}
 	}
-	return dnsmessage.RCodeSuccess, out
+	return out, dnsmessage.RCodeSuccess
 }
 
 func reply(q dnsmessage.Header, question *dnsmessage.Question, rcode dnsmessage.RCode, addrs []netip.Addr, ttl uint32) []byte {
@@ -271,8 +308,15 @@ func reply(q dnsmessage.Header, question *dnsmessage.Question, rcode dnsmessage.
 			return nil
 		}
 		for _, a := range addrs {
-			rh := dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: ttl}
-			if err := b.AResource(rh, dnsmessage.AResource{A: a.As4()}); err != nil {
+			if a.Is4() {
+				rh := dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: ttl}
+				if err := b.AResource(rh, dnsmessage.AResource{A: a.As4()}); err != nil {
+					return nil
+				}
+				continue
+			}
+			rh := dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, TTL: ttl}
+			if err := b.AAAAResource(rh, dnsmessage.AAAAResource{AAAA: a.As16()}); err != nil {
 				return nil
 			}
 		}

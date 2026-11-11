@@ -158,7 +158,9 @@ destinations:
     treatment: deny
 passthrough:
   - cidr: 127.0.0.0/8
-    ports: [%d]
+    ports: [%[1]d]
+  - cidr: ::1/128
+    ports: [%[1]d]
 audit:
   bodyLimitBytes: 16
 `
@@ -803,6 +805,48 @@ func TestAPassthroughAddressIsConnectedStraightAndMeasured(t *testing.T) {
 
 	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindPassthrough })
 	if rec.Address != echo.String() || rec.Verdict != audit.Allow || rec.BytesUp != 5 || rec.BytesDown != 5 || rec.Treatment != "passthrough" {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
+func TestAnIPv6PassthroughAddressIsConnectedStraightAndRecordedWithItsAddress(t *testing.T) {
+	ln, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback here: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = c.Close() }()
+				_, _ = io.Copy(c, c)
+			}()
+		}
+	}()
+	echo := ln.Addr().(*net.TCPAddr)
+	e := newEnv(t, echo.Port)
+	e.setOrigDst(echo.String())
+	conn, err := net.Dial("tcp", e.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "hello" {
+		t.Fatalf("echo = %q, %v", buf, err)
+	}
+	_ = conn.(*net.TCPConn).CloseWrite()
+	_, _ = io.Copy(io.Discard, conn)
+	_ = conn.Close()
+
+	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindPassthrough })
+	if rec.Address != fmt.Sprintf("[::1]:%d", echo.Port) || rec.Verdict != audit.Allow || rec.BytesUp != 5 || rec.BytesDown != 5 {
 		t.Errorf("record = %+v", rec)
 	}
 }
