@@ -22,11 +22,11 @@ type running struct {
 	stop           func() int
 }
 
-// startGate runs the gate with an upstream sender built in, and waits until
-// it listens on each of want ("workspace/dns-udp", "metrics", ...).
+// startGate runs the gate, and waits until it listens on each of want
+// ("workspace/dns-udp", "metrics", ...). The caller builds an upstream
+// sender in first.
 func startGate(t *testing.T, s setup, want []string, extra ...string) *running {
 	t.Helper()
-	withUpstream(t)
 	var mu sync.Mutex
 	addrs := map[string]net.Addr{}
 	ready := make(chan struct{})
@@ -130,6 +130,7 @@ func (r *running) metrics() string {
 }
 
 func TestTheMetricsCountWhatIsRecorded(t *testing.T) {
+	withUpstream(t)
 	r := startGate(t, newSetup(t), []string{"workspace/dns-udp", "metrics"}, "-metrics-listen", "127.0.0.1:0")
 	if rc := r.query("unknown.example.net"); rc != dnsmessage.RCodeNameError {
 		t.Fatalf("rcode = %v, want NXDOMAIN", rc)
@@ -148,6 +149,7 @@ func TestTheMetricsCountWhatIsRecorded(t *testing.T) {
 }
 
 func TestWithoutAMetricsAddressNoneAreServed(t *testing.T) {
+	withUpstream(t)
 	r := startGate(t, newSetup(t), []string{"workspace/dns-udp"})
 	r.query("unknown.example.net")
 	if code := r.stop(); code != 0 {

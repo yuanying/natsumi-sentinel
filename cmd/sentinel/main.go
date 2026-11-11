@@ -27,6 +27,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	// The image may have no time zones of its own for -summary-timezone.
+	_ "time/tzdata"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
 	"github.com/yuanying/natsumi-sentinel/internal/buildinfo"
@@ -35,6 +37,7 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/dnsgate"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
 	"github.com/yuanying/natsumi-sentinel/internal/metrics"
+	"github.com/yuanying/natsumi-sentinel/internal/notice"
 	"github.com/yuanying/natsumi-sentinel/internal/observe"
 	"github.com/yuanying/natsumi-sentinel/internal/origdst"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
@@ -107,6 +110,26 @@ type options struct {
 	gateName, gateAddress     string
 	reload                    time.Duration
 	metrics                   string
+	notices                   noticeOptions
+}
+
+// noticeOptions are the settings of the notices (docs/notices.md). None of
+// them stops the gate: what cannot be used is logged, and the notices go
+// on as well as they can without it.
+type noticeOptions struct {
+	alertmanager    string
+	labels          listFlag
+	summaryAt, zone string
+	queue           int
+}
+
+type listFlag []string
+
+func (l *listFlag) String() string { return strings.Join(*l, ",") }
+
+func (l *listFlag) Set(v string) error {
+	*l = append(*l, v)
+	return nil
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -124,6 +147,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
+	fs.StringVar(&o.notices.alertmanager, "alertmanager-url", "", "Alertmanager's https base URL, reached through authd, to send the notices to; empty only logs them")
+	fs.Var(&o.notices.labels, "alert-label", "a label, name=value, put on every alert sent; repeat for each")
+	fs.StringVar(&o.notices.summaryAt, "summary-at", "00:00", "the time of day, HH:MM, of the daily summary, which covers the day up to it")
+	fs.StringVar(&o.notices.zone, "summary-timezone", "UTC", "the time zone of -summary-at, as an IANA name")
+	fs.IntVar(&o.notices.queue, "notice-queue", 1000, "how many notices may wait to be sent again before the oldest are dropped")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -214,8 +242,15 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	}
 	gm := observe.NewGateMetrics(reg, watcher.Current, fixedNames)
 	// Everything the gate records goes through log, so that the metrics
-	// see it.
-	log := observe.NewRecorder(db, gm.Observe)
+	// and the notices see it. pairs is set below, before anything is
+	// recorded.
+	var pairs *notice.Watcher
+	log := observe.NewRecorder(db, gm.Observe, func(ev observe.Event) { pairs.Observe(ev) })
+	outbox, summary := setUpNotices(o.notices, notice.OutboxConfig{
+		Logger:     logger.With("part", "notices"),
+		Registerer: reg,
+	}, upstream, log, db, func() int64 { return watcher.Current().Audit().BodyLimit })
+	pairs = notice.NewWatcher(notice.WatcherConfig{Log: db, Outbox: outbox, Logger: logger, Registerer: reg})
 
 	var (
 		closers []func() error
@@ -290,7 +325,10 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		go func() { defer wg.Done(); logIf(logger, dns.ServeTCP(tl)) }()
 	}
 
-	wg.Add(2)
+	wg.Add(5)
+	go func() { defer wg.Done(); outbox.Run(ctx) }()
+	go func() { defer wg.Done(); pairs.Run(ctx) }()
+	go func() { defer wg.Done(); summary.Run(ctx) }()
 	go func() {
 		defer wg.Done()
 		watcher.Run(ctx, o.reload, func(err error) { recordReload(log, logger, err) })
@@ -311,6 +349,57 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	<-ctx.Done()
 	logger.Info("the gate is stopping")
 	return nil
+}
+
+// setUpNotices makes the outbox of the notices, sending to Alertmanager
+// through the same sender as the workspace's requests when it is set, and
+// the daily summary. What of the settings cannot be used is logged and left
+// out: the notices are never a reason not to start.
+func setUpNotices(o noticeOptions, cfg notice.OutboxConfig, upstream http.RoundTripper, log observe.Log, db *audit.Log, bodyLimit func() int64) (*notice.Outbox, *notice.Summarizer) {
+	logger := cfg.Logger
+	labels := map[string]string{}
+	for _, l := range o.labels {
+		k, v, ok := strings.Cut(l, "=")
+		if !ok || k == "" {
+			logger.Error("an -alert-label is not name=value, so it is not used", "label", l)
+			continue
+		}
+		labels[k] = v
+	}
+	if o.alertmanager != "" {
+		am, err := notice.NewAlertmanager(notice.AlertmanagerConfig{
+			URL:       o.alertmanager,
+			Transport: upstream,
+			Log:       log,
+			Labels:    labels,
+			BodyLimit: bodyLimit,
+		})
+		if err != nil {
+			// The URL itself is not logged: it is not to carry a
+			// secret, but a mistaken one could.
+			logger.Error("-alertmanager-url cannot be used, so the notices are only logged", "error", err)
+		} else {
+			cfg.Sender = am
+		}
+	} else {
+		logger.Warn("no -alertmanager-url: the notices are only logged")
+	}
+	cfg.Max = o.queue
+
+	zone, err := time.LoadLocation(o.zone)
+	if err != nil {
+		logger.Error("-summary-timezone cannot be used; the summary is in UTC", "zone", o.zone, "error", err)
+		zone = time.UTC
+	}
+	outbox := notice.NewOutbox(cfg)
+	sc := notice.SummaryConfig{Log: db, Outbox: outbox, At: o.summaryAt, Location: zone, Logger: logger, Registerer: cfg.Registerer}
+	summary, err := notice.NewSummarizer(sc)
+	if err != nil {
+		logger.Error("-summary-at cannot be used; the summary is at 00:00", "error", err)
+		sc.At = "00:00"
+		summary, _ = notice.NewSummarizer(sc)
+	}
+	return outbox, summary
 }
 
 // recordReload records the routing table being read again, or failing to
