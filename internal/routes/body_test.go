@@ -169,28 +169,28 @@ func TestAGitHubDestinationNamesWhereTheGateAsksAndHowFieldsAndPushesAreNamed(t 
 		t.Errorf("an API left out is the destination itself: %+v", api.GitHub)
 	}
 
-	p, ok := git.GitHub.MatchPush("create", "refs/tags/v1")
+	p, ok := git.GitHub.MatchPush("create", "o/r", "refs/tags/v1")
 	if !ok || p.Operation != "git.tag.create" || fmt.Sprint(p.Params) != "[{tag v1}]" {
 		t.Errorf("a tag: %+v %v", p, ok)
 	}
-	if p, ok := git.GitHub.MatchPush("update", "refs/heads/feature/x"); !ok || p.Operation != "git.push" || fmt.Sprint(p.Params) != "[{branch feature/x}]" {
+	if p, ok := git.GitHub.MatchPush("update", "o/r", "refs/heads/feature/x"); !ok || p.Operation != "git.push" || fmt.Sprint(p.Params) != "[{branch feature/x}]" {
 		t.Errorf("a branch: %+v %v", p, ok)
 	}
-	if p, ok := git.GitHub.MatchPush("delete", "refs/heads/x"); !ok || p.Operation != "git.ref.delete" {
+	if p, ok := git.GitHub.MatchPush("delete", "o/r", "refs/heads/x"); !ok || p.Operation != "git.ref.delete" {
 		t.Errorf("a delete: %+v %v", p, ok)
 	}
-	if _, ok := git.GitHub.MatchPush("update", "refs/notes/x"); ok {
+	if _, ok := git.GitHub.MatchPush("update", "o/r", "refs/notes/x"); ok {
 		t.Error("a ref no push rule names matched")
 	}
 
-	f, ok := api.GitHub.MatchField("createRef", map[string]any{"name": "refs/tags/v2", "oid": "abc"})
+	f, ok := api.GitHub.MatchField("createRef", map[string]any{"name": "refs/tags/v2", "oid": "abc"}, nil)
 	if !ok || f.Operation != "tag.create" || fmt.Sprint(f.Params) != "[{tag v2}]" || fmt.Sprint(f.Target) != "[owner repo tag]" {
 		t.Errorf("createRef: %+v %v", f, ok)
 	}
-	if _, ok := api.GitHub.MatchField("createRef", map[string]any{"name": "refs/heads/x"}); ok {
+	if _, ok := api.GitHub.MatchField("createRef", map[string]any{"name": "refs/heads/x"}, nil); ok {
 		t.Error("a branch matched the tag rule")
 	}
-	if f, ok := api.GitHub.MatchField("mergePullRequest", nil); !ok || f.Operation != "pr.merge" || f.Target != nil {
+	if f, ok := api.GitHub.MatchField("mergePullRequest", nil, nil); !ok || f.Operation != "pr.merge" || f.Target != nil {
 		t.Errorf("mergePullRequest: %+v %v", f, ok)
 	}
 }
@@ -231,5 +231,80 @@ func TestOnAGitHubDestinationTheOwnerAndRepositoryAreComparedWithoutCase(t *test
 	got := api.NormalizeParams([]routes.Param{{Name: "owner", Value: "Example"}, {Name: "number", Value: "A"}})
 	if fmt.Sprint(got) != "[{owner example} {number A}]" {
 		t.Errorf("NormalizeParams = %v", got)
+	}
+}
+
+func TestAValuePatternCanPutALiteralBeforeItsParameter(t *testing.T) {
+	yaml := `
+destinations:
+  - name: api.example.com
+    treatment: open
+    default: ask
+    rules:
+      - operation: pr.create.fork
+        methods: [POST]
+        path: /repos/{owner}/{repo}/pulls
+        body: {head: "example-operator:{branch...}"}
+      - operation: pr.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/pulls
+`
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": yaml}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := table.Lookup("api.example.com", 443)
+	m, _ := d.MatchRequest("POST", "/repos/o/r/pulls", routes.ParseBody([]byte(`{"head":"example-operator:fix/x"}`), true))
+	if m.Operation != "pr.create.fork" || fmt.Sprint(m.Params) != "[{owner o} {repo r} {branch fix/x}]" {
+		t.Errorf("from the fork: %+v", m)
+	}
+	for _, head := range []string{"someone:fix", "example-operator:", "fix"} {
+		if m, _ := d.MatchRequest("POST", "/repos/o/r/pulls", routes.ParseBody([]byte(`{"head":"`+head+`"}`), true)); m.Operation != "pr.create" {
+			t.Errorf("%s: %q", head, m.Operation)
+		}
+	}
+	bad := strings.Replace(yaml, `"example-operator:{branch...}"`, `"{branch}:x"`, 1)
+	if _, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": bad})); err == nil {
+		t.Error("a literal after a parameter was taken")
+	}
+}
+
+func TestAPushRuleCanNameTheRepositoryAndAFieldRuleWhatTheGateLookedUp(t *testing.T) {
+	yaml := `
+destinations:
+  - name: api.example.com
+    treatment: open
+    default: ask
+    github:
+      graphql:
+        - field: createPullRequest
+          on: {headRepository_owner: example-operator}
+          operation: pr.create.fork
+        - field: createPullRequest
+          operation: pr.create
+      pushes:
+        - operation: push.own
+          kinds: [create, update]
+          repository: example-operator/{name}
+        - operation: push.other
+          kinds: [create, update]
+`
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": yaml}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := table.Lookup("api.example.com", 443)
+	if p, _ := d.GitHub.MatchPush("update", "example-operator/r", "refs/heads/x"); p.Operation != "push.own" || fmt.Sprint(p.Params) != "[{name r}]" {
+		t.Errorf("own: %+v", p)
+	}
+	if p, _ := d.GitHub.MatchPush("update", "someone/r", "refs/heads/x"); p.Operation != "push.other" {
+		t.Errorf("other: %+v", p)
+	}
+	fork := []routes.Param{{Name: "owner", Value: "o"}, {Name: "headRepository_owner", Value: "example-operator"}}
+	if f, _ := d.GitHub.MatchField("createPullRequest", nil, fork); f.Operation != "pr.create.fork" {
+		t.Errorf("from the fork: %+v", f)
+	}
+	if f, _ := d.GitHub.MatchField("createPullRequest", nil, fork[:1]); f.Operation != "pr.create" {
+		t.Errorf("not from the fork: %+v", f)
 	}
 }

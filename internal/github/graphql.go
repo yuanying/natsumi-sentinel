@@ -147,7 +147,7 @@ func (c *Connector) mutation(ctx context.Context, req decide.Request, op *ast.Op
 
 	name := "graphql." + field.Name
 	gh := req.Destination.GitHub
-	if m, ok := gh.MatchField(field.Name, args); ok {
+	if m, ok := gh.MatchField(field.Name, args, params); ok {
 		name = m.Operation
 		params = append(params, m.Params...)
 		if m.Target != nil {

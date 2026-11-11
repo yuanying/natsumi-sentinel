@@ -239,4 +239,3 @@ func readNode(r *rawNode) (node, bool) {
 	}
 	return n, true
 }
-

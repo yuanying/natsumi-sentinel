@@ -66,7 +66,7 @@ func (c *Connector) push(ctx context.Context, req decide.Request) (decide.Result
 
 		params := []routes.Param{{Name: "owner", Value: owner}, {Name: "repo", Value: repo}, {Name: "ref", Value: cmd.ref}}
 		name := ""
-		if m, ok := gh.MatchPush(kind, cmd.ref); ok {
+		if m, ok := gh.MatchPush(kind, owner+"/"+repo, cmd.ref); ok {
 			name = m.Operation
 			params = append(params, m.Params...)
 		}

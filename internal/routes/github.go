@@ -26,6 +26,9 @@ type FieldRule struct {
 	Field     string
 	Operation string
 	args      []fieldPattern
+	// on are patterns on the parameters of what the mutation is on, as
+	// the connector looked them up.
+	on []fieldPattern
 	// Target names the parameters that make the target. Nil leaves it to
 	// the connector: the parameters of what the mutation is on.
 	Target []string
@@ -37,6 +40,8 @@ type PushRule struct {
 	// Kinds are the kinds of change it names (PushKinds).
 	Kinds []string
 	ref   valuePattern
+	// repository matches "owner/repo".
+	repository valuePattern
 }
 
 // PushKinds are the kinds of change a push makes to a ref.
@@ -51,9 +56,18 @@ type FieldMatch struct {
 }
 
 // MatchField finds the first rule for field whose argument patterns all
-// match args. args holds the field's arguments, and the fields of its
-// input argument beside them; only scalars are compared.
-func (g *GitHub) MatchField(field string, args map[string]any) (FieldMatch, bool) {
+// match args and whose patterns on what the mutation is on all match
+// params. args holds the field's arguments, and the fields of its input
+// argument beside them; only scalars are compared.
+func (g *GitHub) MatchField(field string, args map[string]any, params []Param) (FieldMatch, bool) {
+	param := func(name string) (string, bool) {
+		for _, p := range params {
+			if p.Name == name {
+				return p.Value, true
+			}
+		}
+		return "", false
+	}
 	value := func(name string) (string, bool) {
 		v, ok := args[name]
 		if !ok {
@@ -71,11 +85,15 @@ func (g *GitHub) MatchField(field string, args map[string]any) (FieldMatch, bool
 		if r.Field != field {
 			continue
 		}
-		params, ok := matchFields(r.args, value)
+		got, ok := matchFields(r.args, value)
 		if !ok {
 			continue
 		}
-		return FieldMatch{Operation: r.Operation, Params: params, Target: r.Target}, true
+		more, ok := matchFields(r.on, param)
+		if !ok {
+			continue
+		}
+		return FieldMatch{Operation: r.Operation, Params: append(got, more...), Target: r.Target}, true
 	}
 	return FieldMatch{}, false
 }
@@ -87,18 +105,27 @@ type PushMatch struct {
 	Params []Param
 }
 
-// MatchPush finds the first rule naming a change of kind to ref.
-func (g *GitHub) MatchPush(kind, ref string) (PushMatch, bool) {
+// MatchPush finds the first rule naming a change of kind to ref in the
+// repository ("owner/repo").
+func (g *GitHub) MatchPush(kind, repository, ref string) (PushMatch, bool) {
 	for _, r := range g.Pushes {
 		if !slices.Contains(r.Kinds, kind) {
 			continue
 		}
 		var params []Param
-		if r.ref != nil {
-			var ok bool
-			if params, ok = r.ref.match(ref); !ok {
+		if r.repository != nil {
+			got, ok := r.repository.match(repository)
+			if !ok {
 				continue
 			}
+			params = got
+		}
+		if r.ref != nil {
+			got, ok := r.ref.match(ref)
+			if !ok {
+				continue
+			}
+			params = append(params, got...)
 		}
 		return PushMatch{Operation: r.Operation, Params: params}, true
 	}
@@ -110,13 +137,15 @@ type rawGitHub struct {
 	GraphQL []struct {
 		Field     string            `yaml:"field"`
 		Args      map[string]string `yaml:"args"`
+		On        map[string]string `yaml:"on"`
 		Operation string            `yaml:"operation"`
 		Target    []string          `yaml:"target"`
 	} `yaml:"graphql"`
 	Pushes []struct {
-		Operation string   `yaml:"operation"`
-		Kinds     []string `yaml:"kinds"`
-		Ref       string   `yaml:"ref"`
+		Operation  string   `yaml:"operation"`
+		Kinds      []string `yaml:"kinds"`
+		Repository string   `yaml:"repository"`
+		Ref        string   `yaml:"ref"`
 	} `yaml:"pushes"`
 }
 
@@ -138,16 +167,20 @@ func (rg *rawGitHub) check(self string) (*GitHub, error) {
 		if !operationName.MatchString(f.Operation) {
 			return nil, fmt.Errorf("graphql[%d]: operation: %q is not an operation name", i, f.Operation)
 		}
-		args, _, err := parseFields(f.Args, nil)
+		args, taken, err := parseFields(f.Args, nil)
 		if err != nil {
 			return nil, fmt.Errorf("graphql[%d]: args: %w", i, err)
+		}
+		on, _, err := parseFields(f.On, taken)
+		if err != nil {
+			return nil, fmt.Errorf("graphql[%d]: on: %w", i, err)
 		}
 		for _, t := range f.Target {
 			if !paramName.MatchString(t) {
 				return nil, fmt.Errorf("graphql[%d]: target: %q is not a parameter name", i, t)
 			}
 		}
-		g.GraphQL = append(g.GraphQL, FieldRule{Field: f.Field, Operation: f.Operation, args: args, Target: f.Target})
+		g.GraphQL = append(g.GraphQL, FieldRule{Field: f.Field, Operation: f.Operation, args: args, on: on, Target: f.Target})
 	}
 	for i, p := range rg.Pushes {
 		if !operationName.MatchString(p.Operation) {
@@ -162,17 +195,25 @@ func (rg *rawGitHub) check(self string) (*GitHub, error) {
 			}
 		}
 		r := PushRule{Operation: p.Operation, Kinds: p.Kinds}
-		if p.Ref != "" {
-			ref, err := parseValuePattern(p.Ref)
+		var taken []string
+		for _, f := range []struct {
+			name, pattern string
+			to            *valuePattern
+		}{{"repository", p.Repository, &r.repository}, {"ref", p.Ref, &r.ref}} {
+			if f.pattern == "" {
+				continue
+			}
+			vp, err := parseValuePattern(f.pattern)
 			if err != nil {
-				return nil, fmt.Errorf("pushes[%d]: ref: %w", i, err)
+				return nil, fmt.Errorf("pushes[%d]: %s: %w", i, f.name, err)
 			}
-			for _, name := range ref.params() {
-				if slices.Contains(pushParams, name) {
-					return nil, fmt.Errorf("pushes[%d]: ref: {%s} is a parameter the connector gives", i, name)
+			for _, name := range vp.params() {
+				if slices.Contains(pushParams, name) || slices.Contains(taken, name) {
+					return nil, fmt.Errorf("pushes[%d]: %s: {%s} is a parameter given already", i, f.name, name)
 				}
+				taken = append(taken, name)
 			}
-			r.ref = ref
+			*f.to = vp
 		}
 		g.Pushes = append(g.Pushes, r)
 	}

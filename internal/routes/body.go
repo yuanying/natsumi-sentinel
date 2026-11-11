@@ -14,6 +14,8 @@ import (
 // at its fields. Only a body read whole is one.
 type Body struct {
 	fields map[string]string
+	// strings are the fields that are JSON strings.
+	strings map[string]bool
 }
 
 // ParseBody reads b as one JSON object. complete says whether b is the whole
@@ -31,6 +33,7 @@ func ParseBody(b []byte, complete bool) *Body {
 		return nil
 	}
 	fields := map[string]string{}
+	strs := map[string]bool{}
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
@@ -48,6 +51,7 @@ func ParseBody(b []byte, complete bool) *Body {
 			return nil
 		}
 		fields[key] = scalarText(raw)
+		strs[key] = len(raw) > 0 && raw[0] == '"'
 	}
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
 		return nil
@@ -55,7 +59,12 @@ func ParseBody(b []byte, complete bool) *Body {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil
 	}
-	return &Body{fields: fields}
+	return &Body{fields: fields, strings: strs}
+}
+
+// IsString reports whether the field is a JSON string.
+func (b *Body) IsString(name string) bool {
+	return b != nil && b.strings[name]
 }
 
 // Field gives the text of a scalar field: a string as it is, a number or a
@@ -106,9 +115,21 @@ func parseValuePattern(p string) (valuePattern, error) {
 	parts := strings.Split(p, "/")
 	var out valuePattern
 	for i, part := range parts {
+		// A literal may come before the parameter of a part
+		// ("owner:{branch}"), and nothing after it.
+		prefix := ""
+		if j := strings.Index(part, "{"); j > 0 {
+			prefix, part = part[:j], part[j:]
+		}
 		s, err := parseSegment(part)
 		if err != nil {
 			return nil, err
+		}
+		if prefix != "" {
+			if s.param == "" || strings.ContainsAny(prefix, "{}") {
+				return nil, fmt.Errorf("%q: a literal can only come before a parameter", prefix+part)
+			}
+			s.literal = prefix
 		}
 		if s.rest && i != len(parts)-1 {
 			return nil, fmt.Errorf("{%s...} is not the last part", s.param)

@@ -152,8 +152,11 @@ func matchSegments(segments []segment, parts []string) ([]Param, bool) {
 	var params []Param
 	for i, s := range segments {
 		if s.rest {
-			rest := strings.Join(parts[i:], "/")
-			if i >= len(parts) || rest == "" {
+			if i >= len(parts) {
+				return nil, false
+			}
+			rest, ok := strings.CutPrefix(strings.Join(parts[i:], "/"), s.literal)
+			if !ok || rest == "" {
 				return nil, false
 			}
 			return append(params, Param{s.param, rest}), true
@@ -163,10 +166,12 @@ func matchSegments(segments []segment, parts []string) ([]Param, bool) {
 		}
 		switch {
 		case s.param != "":
-			if parts[i] == "" {
+			// A parameter's literal, when it has one, comes before it.
+			v, ok := strings.CutPrefix(parts[i], s.literal)
+			if !ok || v == "" {
 				return nil, false
 			}
-			params = append(params, Param{s.param, parts[i]})
+			params = append(params, Param{s.param, v})
 		case parts[i] != s.literal:
 			return nil, false
 		}
