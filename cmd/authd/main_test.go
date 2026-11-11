@@ -325,3 +325,83 @@ func TestAKeyFileThatCannotBeReadAtTheStartDoesNotStopTheStart(t *testing.T) {
 		t.Fatalf("RoundTrip = %v, want the request that uses the key refused as credential-unavailable", err)
 	}
 }
+
+func TestCheckSaysAUsableRegistrationCanBeUsedWithoutListening(t *testing.T) {
+	config, socket := setup(t)
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(--check) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "can be used") {
+		t.Errorf("stdout %q does not say the registration can be used", stdout.String())
+	}
+	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the socket exists: %v", err)
+	}
+}
+
+func TestCheckFailsOnARegistrationThatCannotBeUsed(t *testing.T) {
+	for name, text := range map[string]string{
+		"broken YAML":   "upstreams: [",
+		"unknown field": "upstreams:\n  - name: api.example.com\n    nmae: x\n",
+		"no upstreams":  "upstreams: []\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			config, _ := setup(t)
+			if err := os.WriteFile(config, []byte(text), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr); code != 1 {
+				t.Fatalf("run(--check) = %d, want 1", code)
+			}
+			if !strings.Contains(stderr.String(), "registration") {
+				t.Errorf("stderr %q does not say the registration is the trouble", stderr.String())
+			}
+		})
+	}
+}
+
+func TestCheckFailsOnACAFileThatCannotBeRead(t *testing.T) {
+	config, _ := setup(t)
+	keyFile := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyFile, []byte(testKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withCredential(t, config, keyFile, filepath.Join(t.TempDir(), "missing-ca.pem"))
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr); code != 1 {
+		t.Fatalf("run(--check) = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "ca_file") {
+		t.Errorf("stderr %q does not name ca_file", stderr.String())
+	}
+}
+
+func TestCheckDoesNotFailOnAKeyFileThatIsNotThereButSaysSo(t *testing.T) {
+	config, _ := setup(t)
+	keyFile := filepath.Join(t.TempDir(), "missing-key")
+	withCredential(t, config, keyFile, "")
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(--check) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "credentials[0]") || !strings.Contains(out, keyFile) {
+		t.Errorf("stdout %q does not name the key file that cannot be read", out)
+	}
+	if strings.Contains(out+stderr.String(), testSurrogate) {
+		t.Errorf("the output shows the surrogate")
+	}
+}
+
+func TestCheckNeedsOnlyTheConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--check"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("run(--check) without --config = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "config") {
+		t.Errorf("stderr %q does not name --config", stderr.String())
+	}
+}
