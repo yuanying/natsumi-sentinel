@@ -193,3 +193,29 @@ func TestOnlyAnHTTPSAddressOfAlertmanagerIsTaken(t *testing.T) {
 		}
 	}
 }
+
+func TestAnAnswerIsAnAlertOfItsOwnName(t *testing.T) {
+	var body []byte
+	am, err := notice.NewAlertmanager(notice.AlertmanagerConfig{
+		URL: "https://alerts.example.com",
+		Transport: tripper(func(r *http.Request) (*http.Response, error) {
+			body, _ = io.ReadAll(r.Body)
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: http.Header{}}, nil
+		}),
+		Log: &recLog{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := notice.Notice{Type: notice.TypeAnswer, At: at, Labels: map[string]string{"answer": "allowed", "approval": "ap-1"}, Summary: "s"}
+	if err := am.Send(context.Background(), []notice.Notice{n}); err != nil {
+		t.Fatal(err)
+	}
+	var alerts []alert
+	if err := json.Unmarshal(body, &alerts); err != nil || len(alerts) != 1 {
+		t.Fatalf("posted %s, %v", body, err)
+	}
+	if l := alerts[0].Labels; l["alertname"] != "SentinelAnswer" || l["answer"] != "allowed" || l["approval"] != "ap-1" || l["severity"] != "info" {
+		t.Errorf("labels = %v", l)
+	}
+}

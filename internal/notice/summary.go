@@ -144,34 +144,38 @@ func (s *Summarizer) Build(ctx context.Context, from, to time.Time) (Notice, err
 		return Notice{}, err
 	}
 
-	var writes, refused int64
+	var writes, asked, denied int64
 	for _, w := range day.Writes {
 		writes += w.Count
 	}
-	for _, r := range day.Refusals {
-		refused += r.Count
+	for _, r := range day.Asks {
+		asked += r.Count
 	}
-	counts := fmt.Sprintf("%s, %s, %d refused", plural(writes, "write"), plural(int64(len(seen)), "new pair"), refused)
+	for _, r := range day.Denials {
+		denied += r.Count
+	}
+	counts := fmt.Sprintf("%s, %s, %d asked, %d denied, %s", plural(writes, "write"), plural(int64(len(seen)), "new pair"),
+		asked, denied, plural(int64(len(day.Answers)), "answer"))
 
 	var b strings.Builder
 	layout := "2006-01-02 15:04 MST"
 	fmt.Fprintf(&b, "From %s to %s: %s.\n", from.In(s.cfg.Location).Format(layout), to.In(s.cfg.Location).Format(layout), counts)
 
-	fmt.Fprintf(&b, "\nWrites let through, by destination and method: %s\n", plural(writes, "write"))
+	fmt.Fprintf(&b, "\nWrites let through, by destination and operation: %s\n", plural(writes, "write"))
 	s.lines(&b, len(day.Writes), func(i int) string {
 		w := day.Writes[i]
-		return fmt.Sprintf("%d  %s %s", w.Count, w.Name, w.Method)
+		return fmt.Sprintf("%d  %s", w.Count, strings.Join(nonEmpty(w.Name, w.Operation, w.Method), " "))
 	})
 	fmt.Fprintf(&b, "\nSeen for the first time: %s\n", plural(int64(len(seen)), "new pair"))
 	s.lines(&b, len(seen), func(i int) string {
 		return seen[i].Pair + "  " + seen[i].Key
 	})
-	fmt.Fprintf(&b, "\nNot let through: %d refused\n", refused)
-	s.lines(&b, len(day.Refusals), func(i int) string {
-		r := day.Refusals[i]
-		what := strings.Join(nonEmpty(string(r.Verdict), string(r.Kind), r.Name, r.Method, r.Path), " ")
-		return fmt.Sprintf("%d  %s: %s", r.Count, what, r.Reason)
-	})
+	fmt.Fprintf(&b, "\nAsked the owner: %d asked\n", asked)
+	s.lines(&b, len(day.Asks), func(i int) string { return refusalLine(day.Asks[i]) })
+	fmt.Fprintf(&b, "\nDenied: %d denied\n", denied)
+	s.lines(&b, len(day.Denials), func(i int) string { return refusalLine(day.Denials[i]) })
+	fmt.Fprintf(&b, "\nAnswers of the owner's: %s\n", plural(int64(len(day.Answers)), "answer"))
+	s.lines(&b, len(day.Answers), func(i int) string { return s.answerLine(day.Answers[i]) })
 
 	return Notice{
 		Type:        TypeDailySummary,
@@ -180,6 +184,34 @@ func (s *Summarizer) Build(ctx context.Context, from, to time.Time) (Notice, err
 		Summary:     "Sentinel's day: " + counts,
 		Description: b.String(),
 	}, nil
+}
+
+func refusalLine(r audit.RefusalCount) string {
+	what := strings.Join(nonEmpty(string(r.Kind), r.Name, r.Operation, r.Target, r.Method, r.Path), " ")
+	return fmt.Sprintf("%d  %s: %s", r.Count, what, r.Reason)
+}
+
+// answerLine tells one answer. The reason of a revocation is not told: it
+// can name the request a grant of one request was for, query and all.
+func (s *Summarizer) answerLine(a audit.Answer) string {
+	what := strings.Join(nonEmpty(a.Name, a.Operation, a.Target), " ")
+	if a.Operation == "" {
+		what = strings.Join(nonEmpty(a.Name, a.Method, a.Path), " ")
+	}
+	var head string
+	switch {
+	case a.Verdict == audit.Allow:
+		head = "allowed " + a.Approval
+	case a.Grant != "":
+		head = "revoked " + a.Grant + " of " + a.Approval
+	default:
+		head = "denied " + a.Approval
+	}
+	line := strings.Join(nonEmpty(a.Time.In(s.cfg.Location).Format("15:04 MST"), a.Source, head+": "+what), "  ")
+	if a.Verdict == audit.Allow {
+		line += "; " + a.Reason
+	}
+	return line
 }
 
 // lines writes up to Lines lines of a part, and how many were left out.

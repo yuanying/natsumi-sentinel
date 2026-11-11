@@ -651,6 +651,17 @@ func (l *Ledger) Approvals(ctx context.Context, f Filter) ([]*Approval, error) {
 	return out, rows.Err()
 }
 
+// CountOpen counts the approvals waiting for an answer: open, and not past
+// their time, whether or not they have been swept yet.
+func (l *Ledger) CountOpen(ctx context.Context) (int, error) {
+	var n int
+	err := l.db.QueryRowContext(ctx, `SELECT count(*) FROM approvals WHERE state = 'open' AND expires > ?`, formatTime(l.now())).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("read the ledger: %w", err)
+	}
+	return n, nil
+}
+
 // Grants lists the grants in effect, oldest first.
 func (l *Ledger) Grants(ctx context.Context) ([]*Grant, error) {
 	return l.grants(ctx, "")
