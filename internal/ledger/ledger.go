@@ -407,7 +407,8 @@ func (l *Ledger) Hold(ctx context.Context, f Facts, s routes.ApprovalSettings) (
 
 // Ask makes an approval of operations asked for beforehand: a bundle of
 // grants for one request each. The workspace does not choose the scope.
-func (l *Ledger) Ask(ctx context.Context, source string, items []Facts, s routes.ApprovalSettings) (*Approval, error) {
+// record is called with the approval before it is kept, as for Answer.
+func (l *Ledger) Ask(ctx context.Context, source string, items []Facts, s routes.ApprovalSettings, record func(*Approval) error) (*Approval, error) {
 	now := l.now()
 	var parts []string
 	for i := range items {
@@ -435,6 +436,11 @@ func (l *Ledger) Ask(ctx context.Context, source string, items []Facts, s routes
 	defer func() { _ = tx.Rollback() }()
 	if err := insertApproval(ctx, tx, a); err != nil {
 		return nil, err
+	}
+	if record != nil {
+		if err := record(a); err != nil {
+			return nil, fmt.Errorf("the request could not be recorded, so it was not taken: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("write the ledger: %w", err)

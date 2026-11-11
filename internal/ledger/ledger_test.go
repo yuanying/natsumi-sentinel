@@ -350,7 +350,7 @@ func TestAskingBeforehandIsABundleOfGrantsForOneRequestEach(t *testing.T) {
 	for i := range items {
 		items[i].Method, items[i].Path, items[i].Body, items[i].Fingerprint = "", "", nil, ""
 	}
-	a, err := l.Ask(ctx, "workspace", items, settings)
+	a, err := l.Ask(ctx, "workspace", items, settings, nil)
 	if err != nil {
 		t.Fatalf("Ask: %v", err)
 	}
@@ -371,6 +371,18 @@ func TestAskingBeforehandIsABundleOfGrantsForOneRequestEach(t *testing.T) {
 	}
 	if g, _ := l.Lookup(ctx, merge("7")); g != nil {
 		t.Error("a merge that was not asked for went through")
+	}
+}
+
+func TestAskingBeforehandThatCannotBeRecordedIsNotKept(t *testing.T) {
+	l, _, _ := open(t)
+	ctx := context.Background()
+	items := []ledger.Facts{merge("5")}
+	if _, err := l.Ask(ctx, "workspace", items, settings, func(*ledger.Approval) error { return errors.New("disk full") }); err == nil {
+		t.Fatal("Ask succeeded though it was not recorded")
+	}
+	if all, _ := l.Approvals(ctx, ledger.Filter{}); len(all) != 0 {
+		t.Errorf("approvals = %+v, want none", all)
 	}
 }
 

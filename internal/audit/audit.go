@@ -42,6 +42,12 @@ const (
 	KindDNS Kind = "dns"
 	// KindConfig is the gate reading its routing table again.
 	KindConfig Kind = "config"
+	// KindAgent is the workspace asking the gate for an approval
+	// beforehand, through the gate's own address.
+	KindAgent Kind = "agent"
+	// KindAnswer is the owner's answer to an approval, or the owner
+	// revoking a grant, taken on the approvals socket.
+	KindAnswer Kind = "answer"
 )
 
 // Verdict is how the gate decided.
