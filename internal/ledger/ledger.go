@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +81,10 @@ type Facts struct {
 	Params    []routes.Param `json:"params,omitempty"`
 	// Target names the params that make the target.
 	Target []string `json:"target,omitempty"`
+	// Facts are what the gate looked up upstream about the target (a
+	// head SHA, whether a commit is on the default branch). They are
+	// shown, and no grant is matched by them.
+	Facts []routes.Param `json:"facts,omitempty"`
 	// TargetText is the target as the record writes it; Hold and Ask
 	// fill it in.
 	TargetText string      `json:"targetText,omitempty"`
@@ -290,6 +295,19 @@ func (l *Ledger) tell(t EventType, a *Approval) {
 // Lookup finds a grant that lets the request in f through, and uses it up
 // if it is for one request. It returns nil when there is none.
 func (l *Ledger) Lookup(ctx context.Context, f Facts) (*Grant, error) {
+	grants, err := l.LookupAll(ctx, []Facts{f})
+	if err != nil {
+		return nil, err
+	}
+	return grants[0], nil
+}
+
+// LookupAll finds a grant for each of the requests in fs, which go out
+// together or not at all (the refs of one push). The grants for one
+// request are used up only when every request has a grant: otherwise
+// nothing goes out, and nothing is used. A request without a grant has nil
+// in its place.
+func (l *Ledger) LookupAll(ctx context.Context, fs []Facts) ([]*Grant, error) {
 	now := formatTime(l.now())
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -297,6 +315,43 @@ func (l *Ledger) Lookup(ctx context.Context, f Facts) (*Grant, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	grants := make([]*Grant, len(fs))
+	var (
+		taken []string
+		once  []string
+		all   = true
+	)
+	for i, f := range fs {
+		g, scope, err := findGrant(ctx, tx, f, now, taken)
+		if err != nil {
+			return nil, err
+		}
+		if g == nil {
+			all = false
+			continue
+		}
+		grants[i] = g
+		taken = append(taken, g.ID)
+		if scope == ScopeOnce {
+			once = append(once, g.ID)
+		}
+	}
+	if !all {
+		return grants, nil
+	}
+	for _, id := range once {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM grants WHERE id = ?`, id); err != nil {
+			return nil, fmt.Errorf("use a grant: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("use a grant: %w", err)
+	}
+	return grants, nil
+}
+
+// findGrant finds the grant that lets f through, other than those taken.
+func findGrant(ctx context.Context, tx *sql.Tx, f Facts, now string, taken []string) (*Grant, Scope, error) {
 	var (
 		cond string
 		args []any
@@ -318,37 +373,52 @@ func (l *Ledger) Lookup(ctx context.Context, f Facts) (*Grant, error) {
 	} else {
 		or("(scope = 'timed' AND operation = '' AND method = ? AND path = ?)", f.Method, f.Path)
 	}
+	notTaken := ""
+	for _, id := range taken {
+		notTaken += " AND id <> ?"
+		args = append(args, id)
+	}
 	// Grants for one request go first, so a timed grant is not what a
 	// once grant is left over for.
-	row := tx.QueryRowContext(ctx, `SELECT doc, scope, id FROM grants
-		WHERE source = ? AND destination = ? AND (expires IS NULL OR expires > ?) AND (`+cond+`)
+	row := tx.QueryRowContext(ctx, `SELECT doc, scope FROM grants
+		WHERE source = ? AND destination = ? AND (expires IS NULL OR expires > ?) AND (`+cond+`)`+notTaken+`
 		ORDER BY scope = 'once' DESC, created LIMIT 1`,
 		append([]any{f.Source, f.Destination, now}, args...)...)
-	var doc, scope, id string
-	if err := row.Scan(&doc, &scope, &id); err != nil {
+	var doc, scope string
+	if err := row.Scan(&doc, &scope); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, "", nil
 		}
-		return nil, fmt.Errorf("read the ledger: %w", err)
+		return nil, "", fmt.Errorf("read the ledger: %w", err)
 	}
 	var g Grant
 	if err := json.Unmarshal([]byte(doc), &g); err != nil {
-		return nil, fmt.Errorf("read the ledger: %w", err)
+		return nil, "", fmt.Errorf("read the ledger: %w", err)
 	}
-	if Scope(scope) == ScopeOnce {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM grants WHERE id = ?`, id); err != nil {
-			return nil, fmt.Errorf("use a grant: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("use a grant: %w", err)
-	}
-	return &g, nil
+	return &g, Scope(scope), nil
 }
 
 // Hold makes an approval of the request in f, or, when the same request
 // is already waiting, counts it on that one. created says which.
 func (l *Ledger) Hold(ctx context.Context, f Facts, s routes.ApprovalSettings) (a *Approval, created bool, err error) {
+	return l.HoldAll(ctx, []Facts{f}, s)
+}
+
+// HoldAll makes one approval of the requests in fs, which go out together
+// or not at all (the refs of one push), or, when the same requests are
+// already waiting, counts them on that one. created says which.
+func (l *Ledger) HoldAll(ctx context.Context, fs []Facts, s routes.ApprovalSettings) (a *Approval, created bool, err error) {
+	if len(fs) == 0 {
+		return nil, false, errors.New("nothing to hold")
+	}
+	fp := fs[0].Fingerprint
+	if len(fs) > 1 {
+		h := sha256.New()
+		for _, f := range fs {
+			_, _ = fmt.Fprintf(h, "%d:%s", len(f.Fingerprint), f.Fingerprint)
+		}
+		fp = "all:" + hex.EncodeToString(h.Sum(nil))
+	}
 	now := l.now()
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -357,7 +427,7 @@ func (l *Ledger) Hold(ctx context.Context, f Facts, s routes.ApprovalSettings) (
 	defer func() { _ = tx.Rollback() }()
 	var doc string
 	err = tx.QueryRowContext(ctx, `SELECT doc FROM approvals WHERE state = 'open' AND source = ? AND fingerprint = ? AND expires > ? LIMIT 1`,
-		f.Source, f.Fingerprint, formatTime(now)).Scan(&doc)
+		fs[0].Source, fp, formatTime(now)).Scan(&doc)
 	switch {
 	case err == nil:
 		a = &Approval{}
@@ -376,24 +446,32 @@ func (l *Ledger) Hold(ctx context.Context, f Facts, s routes.ApprovalSettings) (
 		return nil, false, fmt.Errorf("read the ledger: %w", err)
 	}
 
-	f.TargetText = TargetText(f.Params, f.Target)
+	items := make([]Facts, len(fs))
+	exact := true
+	var parts []string
+	for i, f := range fs {
+		f.TargetText = TargetText(f.Params, f.Target)
+		items[i] = f
+		exact = exact && f.Exact
+		parts = append(parts, summary(f))
+	}
 	a = &Approval{
 		ID:          newID("ap-"),
 		Kind:        KindRequest,
 		State:       Pending,
-		Source:      f.Source,
+		Source:      fs[0].Source,
 		Created:     now,
 		Expires:     now.Add(s.Pending),
-		Items:       []Facts{f},
+		Items:       items,
 		Requests:    1,
-		Summary:     summary(f),
-		fingerprint: f.Fingerprint,
+		Summary:     strings.Join(parts, "; and "),
+		fingerprint: fp,
 	}
-	if f.Exact {
+	if exact {
 		a.Choices = append(a.Choices, onceChoice(s.Once))
 	}
 	for _, d := range s.Durations {
-		a.Choices = append(a.Choices, timedChoice(f, d))
+		a.Choices = append(a.Choices, timedChoice(items, d))
 	}
 	if err := insertApproval(ctx, tx, a); err != nil {
 		return nil, false, err
@@ -800,7 +878,11 @@ func opKey(f Facts) string {
 	for _, s := range []string{f.Destination, f.Operation} {
 		_, _ = fmt.Fprintf(h, "%d:%s", len(s), s)
 	}
-	for _, p := range f.Params {
+	// In the order of the names: a request and the same operation asked
+	// for beforehand may give them in different orders.
+	params := slices.Clone(f.Params)
+	slices.SortStableFunc(params, func(a, b routes.Param) int { return strings.Compare(a.Name, b.Name) })
+	for _, p := range params {
 		_, _ = fmt.Fprintf(h, "%d:%s%d:%s", len(p.Name), p.Name, len(p.Value), p.Value)
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -815,11 +897,16 @@ func onceChoice(d time.Duration) Choice {
 	}
 }
 
-func timedChoice(f Facts, d time.Duration) Choice {
-	what := operationText(f) + " on " + f.Destination
-	if f.Operation == "" {
-		what = f.Method + " " + f.Path + " on " + f.Destination
+func timedChoice(fs []Facts, d time.Duration) Choice {
+	var whats []string
+	for _, f := range fs {
+		what := operationText(f) + " on " + f.Destination
+		if f.Operation == "" {
+			what = f.Method + " " + f.Path + " on " + f.Destination
+		}
+		whats = append(whats, what)
 	}
+	what := strings.Join(whats, " and ")
 	return Choice{
 		ID:      routes.FormatDuration(d),
 		Scope:   ScopeTimed,
@@ -863,6 +950,13 @@ func summary(f Facts) string {
 		}
 	} else {
 		s += ", which no rule names"
+	}
+	if len(f.Facts) > 0 {
+		var facts []string
+		for _, p := range f.Facts {
+			facts = append(facts, p.Name+"="+p.Value)
+		}
+		s += "; looked up: " + strings.Join(facts, " ")
 	}
 	if f.Body != nil {
 		switch {
