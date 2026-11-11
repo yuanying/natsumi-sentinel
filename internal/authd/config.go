@@ -33,6 +33,9 @@ type Config struct {
 	credentials []*credential
 }
 
+// Credentials is how many credentials the registration holds.
+func (c *Config) Credentials() int { return len(c.credentials) }
+
 type upstream struct {
 	name  string
 	ports []int

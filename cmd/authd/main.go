@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/yuanying/natsumi-sentinel/internal/authd"
 	"github.com/yuanying/natsumi-sentinel/internal/buildinfo"
+	"github.com/yuanying/natsumi-sentinel/internal/metrics"
 	"github.com/yuanying/natsumi-sentinel/internal/peercred"
 )
 
@@ -33,6 +35,10 @@ var version = "dev"
 // authd is told to stop. Watches and log streams do not finish by
 // themselves, so after this they are cut.
 const shutdownGrace = 10 * time.Second
+
+// onMetricsListen is told the address the metrics are served on. Tests
+// replace it.
+var onMetricsListen = func(net.Addr) {}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
@@ -47,6 +53,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	configPath := fs.String("config", "", "the registration of surrogates and upstreams (required)")
 	socketPath := fs.String("socket", "", "the Unix socket to listen on (required)")
 	peerUID := fs.Int("peer-uid", -1, "the gate's UID, the only one whose connections are taken (required)")
+	metricsAddr := fs.String("metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -74,12 +81,38 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		log.Error("the registration cannot be used", "error", err.Error())
 		return 1
 	}
-	handler, err := authd.NewHandler(cfg, authd.Options{Logger: log})
+	m := newAuthdMetrics(cfg.Credentials())
+	handler, err := authd.NewHandler(cfg, authd.Options{
+		Logger:          log,
+		OnError:         m.onError,
+		OnKeyUnreadable: m.onKeyUnreadable,
+	})
 	if err != nil {
 		log.Error("cannot set up the handler", "error", err.Error())
 		return 1
 	}
+	// metricsFailed stays nil, and so never ready, without metrics.
+	var metricsFailed chan error
+	if *metricsAddr != "" {
+		ml, err := net.Listen("tcp", *metricsAddr)
+		if err != nil {
+			log.Error("cannot listen for the metrics", "address", *metricsAddr, "error", err.Error())
+			return 1
+		}
+		onMetricsListen(ml.Addr())
+		metricsCtx, stopMetrics := context.WithCancel(ctx)
+		metricsFailed = make(chan error, 1)
+		stopped := make(chan struct{})
+		go func() {
+			defer close(stopped)
+			if err := metrics.Serve(metricsCtx, ml, m.reg); err != nil {
+				metricsFailed <- err
+			}
+		}()
+		defer func() { stopMetrics(); <-stopped }()
+	}
 	l, err := peercred.Listen(*socketPath, *peerUID, func(uid int) {
+		m.refusedPeers.Inc()
 		log.Warn("refused a connection from another UID", "uid", uid)
 	})
 	if err != nil {
@@ -99,6 +132,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	select {
 	case err := <-served:
 		log.Error("serving stopped", "error", err.Error())
+		return 1
+	case err := <-metricsFailed:
+		log.Error("serving the metrics stopped", "error", err.Error())
+		_ = srv.Close()
 		return 1
 	case <-ctx.Done():
 	}

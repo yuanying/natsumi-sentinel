@@ -310,3 +310,40 @@ func TestRecordsAreListedNewestFirstAndCanBeNarrowedAndPaged(t *testing.T) {
 		}
 	}
 }
+
+func TestMovingALogOfTheFirstVersionKeepsThePairsSeen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.db")
+	l, err := audit.Open(path, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.MarkSeen(context.Background(), audit.Seen{Pair: "destination", Key: "api.example.com", First: at, Record: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+	// Make it a file of the first version, as a gate before this one left
+	// it: its records table and user_version, with the pairs seen beside.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{"DROP TABLE records", audit.SchemaV1ForTest, "PRAGMA user_version = 1"} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	_ = db.Close()
+
+	l, err = audit.Open(path, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	isNew, err := l.MarkSeen(context.Background(), audit.Seen{Pair: "destination", Key: "api.example.com", First: at, Record: 2})
+	if err != nil || isNew {
+		t.Errorf("MarkSeen after the move = %v, %v; want the pair still known", isNew, err)
+	}
+	if err := l.Write(context.Background(), &audit.Record{Time: at, Kind: audit.KindHTTP, Operation: "op"}); err != nil {
+		t.Errorf("Write after the move: %v", err)
+	}
+}

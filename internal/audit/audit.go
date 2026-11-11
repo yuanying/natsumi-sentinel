@@ -48,6 +48,8 @@ const (
 	// KindAnswer is the owner's answer to an approval, or the owner
 	// revoking a grant, taken on the approvals socket.
 	KindAnswer Kind = "answer"
+	// KindGate is a request the gate itself sent upstream (a notice).
+	KindGate Kind = "gate"
 )
 
 // Verdict is how the gate decided.
@@ -196,6 +198,10 @@ func Open(path string, out io.Writer) (*Log, error) {
 	// connection keeps the pragmas on it.
 	db.SetMaxOpenConns(1)
 	if err := migrate(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := createSeen(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

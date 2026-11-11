@@ -27,6 +27,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	// The image may have no time zones of its own for -summary-timezone.
+	_ "time/tzdata"
 
 	"github.com/yuanying/natsumi-sentinel/internal/approvals"
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
@@ -37,6 +39,9 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/dnsgate"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
 	"github.com/yuanying/natsumi-sentinel/internal/ledger"
+	"github.com/yuanying/natsumi-sentinel/internal/metrics"
+	"github.com/yuanying/natsumi-sentinel/internal/notice"
+	"github.com/yuanying/natsumi-sentinel/internal/observe"
 	"github.com/yuanying/natsumi-sentinel/internal/origdst"
 	"github.com/yuanying/natsumi-sentinel/internal/peercred"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
@@ -109,6 +114,27 @@ type options struct {
 	sources                   sourceFlag
 	gateName, gateAddress     string
 	reload                    time.Duration
+	metrics                   string
+	notices                   noticeOptions
+}
+
+// noticeOptions are the settings of the notices (docs/notices.md). None of
+// them stops the gate: what cannot be used is logged, and the notices go
+// on as well as they can without it.
+type noticeOptions struct {
+	alertmanager    string
+	labels          listFlag
+	summaryAt, zone string
+	queue           int
+}
+
+type listFlag []string
+
+func (l *listFlag) String() string { return strings.Join(*l, ",") }
+
+func (l *listFlag) Set(v string) error {
+	*l = append(*l, v)
+	return nil
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -129,6 +155,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution; the workspace's door is http://NAME/")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
+	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
+	fs.StringVar(&o.notices.alertmanager, "alertmanager-url", "", "Alertmanager's https base URL, reached through authd, to send the notices to; empty only logs them")
+	fs.Var(&o.notices.labels, "alert-label", "a label, name=value, put on every alert sent; repeat for each")
+	fs.StringVar(&o.notices.summaryAt, "summary-at", "00:00", "the time of day, HH:MM, of the daily summary, which covers the day up to it")
+	fs.StringVar(&o.notices.zone, "summary-timezone", "UTC", "the time zone of -summary-at, as an IANA name")
+	fs.IntVar(&o.notices.queue, "notice-queue", 1000, "how many notices may wait to be sent again before the oldest are dropped")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -210,11 +242,11 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	if err != nil {
 		return err
 	}
-	log, err := audit.Open(o.db, stdout)
+	db, err := audit.Open(o.db, stdout)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = log.Close() }()
+	defer func() { _ = db.Close() }()
 	book, err := ledger.Open(o.ledger, nil)
 	if err != nil {
 		return err
@@ -222,6 +254,26 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	defer func() { _ = book.Close() }()
 	upstream := newUpstream(o.authdSocket)
 	decider := decide.Table{Ledger: book}
+
+	reg := metrics.NewRegistry(program, version)
+	var fixedNames []string
+	for name := range fixed {
+		fixedNames = append(fixedNames, name)
+	}
+	gm := observe.NewGateMetrics(reg, watcher.Current, fixedNames)
+	// Everything the gate records goes through log, so that the metrics
+	// and the notices see it. pairs is set below, before anything is
+	// recorded.
+	var pairs *notice.Watcher
+	log := observe.NewRecorder(db, gm.Observe, func(ev observe.Event) { pairs.Observe(ev) })
+	outbox, summary := setUpNotices(o.notices, notice.OutboxConfig{
+		Logger:     logger.With("part", "notices"),
+		Registerer: reg,
+	}, upstream, log, db, func() int64 { return watcher.Current().Audit().BodyLimit })
+	pairs = notice.NewWatcher(notice.WatcherConfig{Log: db, Outbox: outbox, Logger: logger, Registerer: reg})
+	// The doors write through log too, so the answers are counted and
+	// watched like every other record, and read straight from db.
+	records := approvalRecords{Log: log, db: db}
 
 	var (
 		closers []func() error
@@ -240,7 +292,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		return fmt.Errorf("the approvals socket: %w", err)
 	}
 	owner := &http.Server{
-		Handler:           approvals.Owner(approvals.OwnerConfig{Ledger: book, Log: log}),
+		Handler:           approvals.Owner(approvals.OwnerConfig{Ledger: book, Log: records}),
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
@@ -254,6 +306,23 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		}
 	}()
 
+	if o.metrics != "" {
+		ml, err := net.Listen("tcp", o.metrics)
+		if err != nil {
+			return fmt.Errorf("the metrics: %w", err)
+		}
+		onListen("", "metrics", ml.Addr())
+		// Stopped with the rest, also when the start fails further on.
+		metricsCtx, stopMetrics := context.WithCancel(ctx)
+		closers = append(closers, func() error { stopMetrics(); return nil })
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := metrics.Serve(metricsCtx, ml, reg); err != nil {
+				logger.Error("serving the metrics stopped", "error", err)
+			}
+		}()
+	}
 	for _, src := range o.sources {
 		cfg := gate.Config{
 			Source:      src.name,
@@ -261,14 +330,14 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			Decider:     decider,
 			Minter:      minter,
 			Log:         log,
-			Upstream:    upstream,
+			Upstream:    gm.Upstream(upstream),
 			OriginalDst: origdst.Lookup,
 			Logger:      logger.With("source", src.name),
 		}
 		for name, addr := range fixed {
 			cfg.AgentAddr = netip.AddrPortFrom(addr, 80)
 			cfg.StatusURL = "http://" + name + "/v1/status"
-			cfg.Agent = approvals.Agent(approvals.AgentConfig{Source: src.name, Ledger: book, Log: log, Routes: watcher.Current})
+			cfg.Agent = approvals.Agent(approvals.AgentConfig{Source: src.name, Ledger: book, Log: records, Routes: watcher.Current})
 		}
 		g := gate.New(cfg)
 		closers = append(closers, g.Close)
@@ -306,20 +375,23 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		go func() { defer wg.Done(); logIf(logger, dns.ServeTCP(tl)) }()
 	}
 
-	wg.Add(3)
+	wg.Add(6)
 	go func() {
 		defer wg.Done()
 		book.RunSweeper(ctx, time.Minute, func(err error) {
 			logger.Error("the ledger could not be swept of what has ended", "error", err)
 		})
 	}()
+	go func() { defer wg.Done(); outbox.Run(ctx) }()
+	go func() { defer wg.Done(); pairs.Run(ctx) }()
+	go func() { defer wg.Done(); summary.Run(ctx) }()
 	go func() {
 		defer wg.Done()
 		watcher.Run(ctx, o.reload, func(err error) { recordReload(log, logger, err) })
 	}()
 	go func() {
 		defer wg.Done()
-		audit.RunPruner(ctx, log, 24*time.Hour,
+		audit.RunPruner(ctx, db, 24*time.Hour,
 			func() time.Duration { return watcher.Current().Audit().Retention },
 			func(n int64, err error) {
 				if err != nil {
@@ -335,9 +407,75 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	return nil
 }
 
+// setUpNotices makes the outbox of the notices, sending to Alertmanager
+// through the same sender as the workspace's requests when it is set, and
+// the daily summary. What of the settings cannot be used is logged and left
+// out: the notices are never a reason not to start.
+func setUpNotices(o noticeOptions, cfg notice.OutboxConfig, upstream http.RoundTripper, log observe.Log, db *audit.Log, bodyLimit func() int64) (*notice.Outbox, *notice.Summarizer) {
+	logger := cfg.Logger
+	labels := map[string]string{}
+	for _, l := range o.labels {
+		k, v, ok := strings.Cut(l, "=")
+		if !ok || k == "" {
+			logger.Error("an -alert-label is not name=value, so it is not used", "label", l)
+			continue
+		}
+		labels[k] = v
+	}
+	if o.alertmanager != "" {
+		am, err := notice.NewAlertmanager(notice.AlertmanagerConfig{
+			URL:       o.alertmanager,
+			Transport: upstream,
+			Log:       log,
+			Labels:    labels,
+			BodyLimit: bodyLimit,
+		})
+		if err != nil {
+			// The URL itself is not logged: it is not to carry a
+			// secret, but a mistaken one could.
+			logger.Error("-alertmanager-url cannot be used, so the notices are only logged", "error", err)
+		} else {
+			cfg.Sender = am
+		}
+	} else {
+		logger.Warn("no -alertmanager-url: the notices are only logged")
+	}
+	cfg.Max = o.queue
+
+	zone, err := time.LoadLocation(o.zone)
+	if err != nil {
+		logger.Error("-summary-timezone cannot be used; the summary is in UTC", "zone", o.zone, "error", err)
+		zone = time.UTC
+	}
+	outbox := notice.NewOutbox(cfg)
+	sc := notice.SummaryConfig{Log: db, Outbox: outbox, At: o.summaryAt, Location: zone, Logger: logger, Registerer: cfg.Registerer}
+	summary, err := notice.NewSummarizer(sc)
+	if err != nil {
+		logger.Error("-summary-at cannot be used; the summary is at 00:00", "error", err)
+		sc.At = "00:00"
+		summary, _ = notice.NewSummarizer(sc)
+	}
+	return outbox, summary
+}
+
+// approvalRecords is the audit log as the approvals doors use it: written
+// through the recorder the metrics and notices watch, read from the file.
+type approvalRecords struct {
+	observe.Log
+	db *audit.Log
+}
+
+func (r approvalRecords) List(ctx context.Context, q audit.Query) ([]*audit.Record, error) {
+	return r.db.List(ctx, q)
+}
+
+func (r approvalRecords) Get(ctx context.Context, id int64) (*audit.Record, error) {
+	return r.db.Get(ctx, id)
+}
+
 // recordReload records the routing table being read again, or failing to
 // be, so that a table that did not take is in the record (docs/adr/0004).
-func recordReload(log *audit.Log, logger *slog.Logger, err error) {
+func recordReload(log observe.Log, logger *slog.Logger, err error) {
 	rec := &audit.Record{Time: time.Now(), Kind: audit.KindConfig}
 	if err != nil {
 		rec.Verdict = audit.Deny
