@@ -10,6 +10,10 @@
 # golangci-lint and govulncheck are declared in go.mod's tool directive and run
 # through `go tool`, so every checkout runs the same version and nothing is
 # installed globally.
+#
+# `make test-netns` runs the tests behind the netns build tag: they redirect
+# real connections with iptables, so they need root and run, through sudo,
+# in a network namespace of their own that is thrown away afterwards.
 
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -24,6 +28,9 @@ LDFLAGS ?= -s -w -X main.version=$(VERSION)
 # What `make dist` builds, as GOOS/GOARCH. Linux only: both programs run as
 # containers in a Pod, on the same two architectures as the images.
 DIST_PLATFORMS ?= linux/amd64 linux/arm64
+# The packages with tests behind the netns build tag, and how to get root.
+NETNS_PKGS ?= ./internal/origdst ./internal/gate
+SUDO ?= sudo
 
 ##@ General
 
@@ -94,6 +101,16 @@ vuln: ## Report known vulnerabilities in the code paths the module calls.
 .PHONY: test
 test: ## Unit tests. Need nothing but the Go toolchain.
 	$(GO) test ./...
+
+# The test binaries are built as the user and only run as root, inside a
+# network namespace that holds nothing but its loopback.
+.PHONY: test-netns
+test-netns: ## Tests that redirect with iptables. Need root (through sudo); run in a network namespace of their own.
+	mkdir -p bin/netns
+	for pkg in $(NETNS_PKGS); do \
+		$(GO) test -c -tags netns -o "bin/netns/$$(basename "$$pkg").test" "$$pkg"; \
+	done
+	$(SUDO) unshare --net sh -eu -c 'ip link set lo up; for pkg in $(NETNS_PKGS); do t="bin/netns/$${pkg##*/}.test"; echo "== $$t"; "$$t" -test.count=1; done'
 
 ##@ Housekeeping
 

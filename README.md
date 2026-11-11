@@ -17,10 +17,13 @@ natsumi-sentinel は、[natsumi](https://github.com/yuanying/natsumi) のイン�
 | `make help` | ターゲットの一覧を出す |
 | `make build` | `bin/sentinel` と `bin/authd` を作る |
 | `make test` | 単体テストを走らせる |
+| `make test-netns` | iptables で本物の接続を向け直すテストを、sudo で使い捨ての network namespace の中で走らせる |
 | `make fmt-check vet lint tidy vuln` | CI と同じ検査をする |
 | `make dist` | 2 つのバイナリを linux/amd64・linux/arm64 の archive にして `dist/` に置く |
 
-どちらのバイナリも `--version` で版を出します。authd の登録の形式は [docs/authd-registration.md](docs/authd-registration.md)、関所と authd の間の形は [docs/authd-protocol.md](docs/authd-protocol.md) にあります。関所はまだ実装されておらず、`--version` のほかの起動のしかたではそう告げてエラーで終わります。
+どちらのバイナリも `--version` で版を出します。authd の登録の形式は [docs/authd-registration.md](docs/authd-registration.md)、関所と authd の間の形は [docs/authd-protocol.md](docs/authd-protocol.md) にあります。
+
+関所は `-check -config <ディレクトリ>` で振り分けを確かめられます。authd へ送る口がまだ組み込まれていないので、ほかの設定がそろっていても、そう告げて起動しません。振り分けの形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md) にあります。
 
 image は 1 つの `Dockerfile` から、target を選んで作ります。
 
