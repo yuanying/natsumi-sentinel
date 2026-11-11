@@ -1,6 +1,7 @@
 package routes_test
 
 import (
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -179,7 +180,7 @@ func TestATableThatCannotBeUsedIsRefused(t *testing.T) {
 		"a field nobody knows":                  {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: allow\n    surprise: 1\n"},
 		"a treatment nobody knows":              {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: inspect\n"},
 		"an open destination without a default": {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n"},
-		"a default that is not allow or deny":   {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: ask\n"},
+		"a default that is not allow, ask or deny": {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: maybe\n"},
 		"a deny destination with a default":     {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: deny\n    default: allow\n"},
 		"a name given twice across files": {
 			"a.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: allow\n",
@@ -196,6 +197,22 @@ func TestATableThatCannotBeUsedIsRefused(t *testing.T) {
 		},
 		"a retention that is not positive": {"routes.yaml": "audit:\n  retentionDays: 0\n"},
 		"a body limit that is negative":    {"routes.yaml": "audit:\n  bodyLimitBytes: -1\n"},
+		"a rule without an operation":      {"routes.yaml": open + "    rules:\n      - path: /a\n"},
+		"a rule whose path does not start with a slash": {"routes.yaml": open + "    rules:\n      - operation: x\n        path: a/b\n"},
+		"a rule with a parameter given twice":           {"routes.yaml": open + "    rules:\n      - operation: x\n        path: /{a}/{a}\n"},
+		"a rest parameter that is not last":             {"routes.yaml": open + "    rules:\n      - operation: x\n        path: /{a...}/b\n"},
+		"a parameter that is half a segment":            {"routes.yaml": open + "    rules:\n      - operation: x\n        path: /a{b}\n"},
+		"a target that is not a parameter":              {"routes.yaml": open + "    rules:\n      - operation: x\n        path: /{a}\n        target: [b]\n"},
+		"an operation name with spaces":                 {"routes.yaml": open + "    rules:\n      - operation: merge it\n"},
+		"an action that is not allow, ask or deny":      {"routes.yaml": open + "    operations:\n      x: maybe\n"},
+		"rules on a deny destination":                   {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: deny\n    rules:\n      - operation: x\n"},
+		"a duration that cannot be read":                {"routes.yaml": "approvals:\n  durations: [1week]\n"},
+		"no durations":                                  {"routes.yaml": "approvals:\n  durations: []\n"},
+		"a once lifetime that is not positive":          {"routes.yaml": "approvals:\n  once: 0s\n"},
+		"approval settings given twice": {
+			"a.yaml": "approvals:\n  once: 1m\n",
+			"b.yaml": "approvals:\n  once: 2m\n",
+		},
 	}
 	for name, files := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -203,6 +220,138 @@ func TestATableThatCannotBeUsedIsRefused(t *testing.T) {
 				t.Fatal("Load returned no error")
 			}
 		})
+	}
+}
+
+const open = "destinations:\n  - name: a.example.com\n    treatment: open\n    default: ask\n"
+
+const withRules = `
+destinations:
+  - name: api.example.com
+    treatment: open
+    default: ask
+    rules:
+      - operation: pulls.merge
+        methods: [PUT]
+        path: /repos/{owner}/{repo}/pulls/{number}/merge
+        target: [owner, repo]
+      - operation: contents.write
+        methods: [PUT, DELETE]
+        path: /repos/{owner}/{repo}/contents/{file...}
+      - operation: read
+        methods: [GET, HEAD]
+    operations:
+      read: allow
+      pulls.merge: ask
+      repos.delete: deny
+`
+
+func TestARuleGivesTheOperationItsParametersAndItsTarget(t *testing.T) {
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": withRules}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	d, _ := table.Lookup("api.example.com", 443)
+	m, ok := d.Match("PUT", "/repos/o/r/pulls/5/merge")
+	if !ok {
+		t.Fatal("no rule matched the merge")
+	}
+	if m.Operation != "pulls.merge" {
+		t.Errorf("operation = %q", m.Operation)
+	}
+	if got := fmt.Sprint(m.Params); got != "[{owner o} {repo r} {number 5}]" {
+		t.Errorf("params = %s", got)
+	}
+	if got := fmt.Sprint(m.Target); got != "[owner repo]" {
+		t.Errorf("target = %s", got)
+	}
+}
+
+func TestATargetLeftOutIsEveryParameterAndARestParameterTakesTheRestOfThePath(t *testing.T) {
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": withRules}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := table.Lookup("api.example.com", 443)
+	m, ok := d.Match("DELETE", "/repos/o/r/contents/docs/a/b.md")
+	if !ok || m.Operation != "contents.write" {
+		t.Fatalf("Match = %+v, %v", m, ok)
+	}
+	if got := fmt.Sprint(m.Params); got != "[{owner o} {repo r} {file docs/a/b.md}]" {
+		t.Errorf("params = %s", got)
+	}
+	if got := fmt.Sprint(m.Target); got != "[owner repo file]" {
+		t.Errorf("target = %s", got)
+	}
+}
+
+func TestTheFirstRuleThatMatchesTheMethodAndPathWins(t *testing.T) {
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": withRules}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := table.Lookup("api.example.com", 443)
+	for _, tc := range []struct {
+		method, path, want string
+	}{
+		{"GET", "/repos/o/r/pulls/5/merge", "read"},
+		{"HEAD", "/anything", "read"},
+		{"POST", "/repos/o/r/pulls/5/merge", ""},
+		{"PUT", "/repos/o/r/pulls/5/merge/", ""},
+		{"PUT", "/repos/o/r/pulls//merge", ""},
+		{"PUT", "/repos/o/r/contents/", ""},
+	} {
+		m, ok := d.Match(tc.method, tc.path)
+		if got := m.Operation; ok != (tc.want != "") || got != tc.want {
+			t.Errorf("Match(%s %s) = %q, %v; want %q", tc.method, tc.path, got, ok, tc.want)
+		}
+	}
+}
+
+func TestAnOperationTakesItsActionFromTheTableOrElseTheDefault(t *testing.T) {
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": withRules}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := table.Lookup("api.example.com", 443)
+	for op, want := range map[string]routes.Action{
+		"read":           routes.Allow,
+		"pulls.merge":    routes.Ask,
+		"repos.delete":   routes.Deny,
+		"contents.write": routes.Ask,
+		"":               routes.Ask,
+	} {
+		if got := d.ActionFor(op); got != want {
+			t.Errorf("ActionFor(%q) = %s, want %s", op, got, want)
+		}
+	}
+}
+
+func TestTheApprovalSettingsDefaultToAnHourADay30DaysAndForever(t *testing.T) {
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": basic}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := table.Approvals()
+	if got := fmt.Sprint(a.Durations); got != "[1h0m0s 24h0m0s 720h0m0s 0s]" {
+		t.Errorf("durations = %s, want 1h, 1d, 30d and forever (0)", got)
+	}
+	if a.Once != 10*time.Minute || a.Pending != 24*time.Hour {
+		t.Errorf("once = %s, pending = %s; want 10m and 24h", a.Once, a.Pending)
+	}
+}
+
+func TestTheApprovalSettingsCanBeSetInDaysHoursAndMinutes(t *testing.T) {
+	table, err := routes.Load(writeFiles(t, map[string]string{"routes.yaml": "approvals:\n  durations: [30m, 7d, forever]\n  once: 5m\n  pending: 2d\n"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := table.Approvals()
+	if got := fmt.Sprint(a.Durations); got != "[30m0s 168h0m0s 0s]" {
+		t.Errorf("durations = %s", got)
+	}
+	if a.Once != 5*time.Minute || a.Pending != 48*time.Hour {
+		t.Errorf("once = %s, pending = %s", a.Once, a.Pending)
 	}
 }
 
