@@ -52,6 +52,7 @@ GitHub の GraphQL の操作は query と mutation の 2 種類である。mutat
 
 - push は、`git-receive-pack` の命令の並びを読み、ref ごとに操作に揃えて表で決める。対象はリポジトリと ref。
 - ref の作成・更新・削除を見分ける（命令の古い SHA と新しい SHA のどちらかが 0 か）。force push かどうかは、③ で上流に問い合わせて見分ける。
+- 上流への問い合わせで force push と見分けられるのは、新しい SHA が上流のすでに知っている commit のとき（巻き戻し、ほかの branch の commit への付け替え）だけである。新しく送る commit は、問い合わせの時点では pack の中にあって上流に無い。そのため rebase や amend で履歴を書き換えた force push は、ふつうの更新と区別できない。見分けられない push は更新として表を引き、承認の画面には fast-forward かどうか分からないことを事実として出す。
 - pack の中身は読まない。命令の並びを読めなければ断る。
 - 取り込み（fetch・clone）は読みとして通す。
 
@@ -70,6 +71,7 @@ GitHub の GraphQL の操作は query と mutation の 2 種類である。mutat
 - 自分のリポジトリの作成は、private で作るときだけ allow にする。public で作る作成と、公開範囲の変更は deny にする。
 - PR のマージと tag の作成は ask にする。
 - 今まで床として断っていた種類は deny にする。ref の削除、守っている branch への force push、`/user` 系（自分の private のリポジトリの作成を除く）、Actions の secrets と variables、webhook、deploy key、リポジトリの設定・collaborator・公開範囲。
+  - 守っている branch への force push の deny は、上の「git の push」で force push と見分けられる場合にだけ効く。守っている branch を確かに守るのは GitHub の ruleset である（下の「床は GitHub の側にある」）。
   - どれも表のデータなので、環境のリポジトリの変更で ask に変えられる（ADR-0004 の Decision「決めていないものは本人に聞く」）。
 - 上のどれにも当たらない書きは、宛先の既定の ask になる。
 
@@ -79,6 +81,7 @@ GitHub の GraphQL の操作は query と mutation の 2 種類である。mutat
 - 運用の係の閉じ込めを決めるリポジトリ（natsumi、関所の配置を持つ環境のリポジトリなど）には、書き込みの権限を渡さない。Approve までで、マージは本人がする。
 - 守っている branch は、GitHub の ruleset でも守る。
 - **machine account が自分で作ったリポジトリでは、machine account 自身が管理者である。** 公開範囲・deploy key・webhook・secrets の変更は GitHub の側では止まらず、表の deny だけが頼りになる。
+- 自分で作ったリポジトリには ruleset の床も無い。そこで履歴を書き換える force push は、関所が見分けられないので止まらない。これは受け入れる。
 
 ### 守る対象と、倒す向き
 
@@ -90,7 +93,7 @@ GitHub の GraphQL の操作は query と mutation の 2 種類である。mutat
 
 - 操作の名前の一覧と、REST の method・path と GraphQL の欄の名前から操作への対応（委譲先: 環境のリポジトリの運用の係の設定）。対応の形式（委譲先: 関所の設定の仕様書）。
 - ③ で引き直す対象の型と、それぞれの問い合わせ（委譲先: 関所の実装の PR）。
-- force push の見分け方と、上流への問い合わせの形（委譲先: 関所の実装の PR）。
+- 上流への問い合わせの形と、見分けられない push を承認の画面にどう出すか（委譲先: 関所の GitHub のコネクタの仕様書）。
 - 書きを許すリポジトリと、マージを許すリポジトリの一覧（委譲先: 環境のリポジトリの運用の係の設定と、GitHub の collaborator の設定）。
 - 道具の手引きで、マージに head の SHA を載せる使い方を案内すること（委譲先: 環境のリポジトリの運用の係の手引き）。
 - 判定器で GitHub の本文（コメント・PR の本文など）を見ること（委譲先: 判定器を入れる版の ADR）。
@@ -105,6 +108,7 @@ GitHub の GraphQL の操作は query と mutation の 2 種類である。mutat
 - 規則に当たらない書きは断られずに聞かれる。最初のうちは聞かれる回数が多い。
 - 1 つの文書に複数の mutation を入れる道具は動かない。
 - 床は GitHub の側の権限と ruleset である。表を誤って緩めれば、machine account の権限の範囲の書きは通る。自分で作ったリポジトリでは、表の deny のほかに止めるものが無い。
+- 履歴を書き換える force push は、ふつうの更新と区別できない。守っている branch では GitHub の ruleset が止める。自分で作ったリポジトリでは止まらない。代わりに、関所は pack を読まずに済む。
 - GraphQL の読みを通すので、読める範囲は machine account が読める範囲すべてになる。読みは記録に残る（ADR-0006）。
 
 ## Alternatives Considered
@@ -112,6 +116,7 @@ GitHub の GraphQL の操作は query と mutation の 2 種類である。mutat
 - **GraphQL を今どおり全部断る**: `gh` の多くのコマンドが使えず、GraphQL でしかできない書きも許す道が無い。
 - **GraphQL の書きを、作業環境向けの口で名前と引数で受け、関所が固定の文書を代わりに送る（操作の定義）**: GitHub の書きの道が、透過の REST と、関所が代わりに実行する道の 2 本になる。設定で書く小さな言語（引数の型・値を引く問い合わせの型・文書）とその実行器を関所に持つことになり、ADR-0001 の Decision「Muse と違えるところ」の「privsep は取らない」とも食い違う。`gh` の書きも動かないままで、操作を足すたびに本人が文書をレビューする負担が続く。mutation を 1 つの文書に 1 つ・いちばん上の欄も 1 つに限れば、任意の文書から対象を確かめる難しさは無くなり、対象は ③ で引き直せる。
 - **GraphQL の文書を任意の形のまま中身で判定する**: どの mutation がどの対象に何をするかを、任意の文書から確かめるのは難しい。形を限れば足りる。
+- **pack の中の commit を関所が読み、新しい commit から親をたどって force push を見分ける**: 見分けは確かになるが、敵意のある入力を解く関所に pack の読み取り（圧縮の展開と object の解析）を持ち込む。「pack の中身は読まない」を保ち、確かな守りは GitHub の ruleset に任せる。
 - **承認の画面に引数の node ID をそのまま出す**: node ID は人が読めず、偽った node ID で別の対象を書ける。
 - **マージの ok を会話の中で取り続ける**: 関所が確かめられず、乗っ取られた運用の係が ok を偽れる。会話の ok で済ませたのは、確かめる仕組みが無かったためで、関所が入ればその前提が無くなる。
 
@@ -128,4 +133,6 @@ GitHub の GraphQL の操作は query と mutation の 2 種類である。mutat
 - 環境のリポジトリ（private）の運用の係の中継のスクリプト `relay/relay.js` の `githubApiWrite`（REST の書き込みの許可リスト、`/user/repos` は `private` が true のときだけ）・`mergeOrTag`・`onDefaultBranch`（マージの許可リスト、tag の commit が default の branch にあるかの確かめ）・`receivePack`（push の命令の並びを読み、ref の削除と守っている branch への push を断る）、冒頭の説明（GraphQL を断る理由）、2026-11-09 確認
 - 環境のリポジトリ（private）の運用の係の手引き `tools/README.md`（マージと tag は本人が会話で ok したものだけ、`gh pr merge` は GraphQL なので使えない）、2026-11-10 確認
 - Git「pack-protocol」の `git-receive-pack` の命令の並び（create は古い SHA が 0、delete は新しい SHA が 0。https://git-scm.com/docs/pack-protocol 、2026-11-09 確認）
+- 関所の GitHub のコネクタの仕様書 `docs/github.md` の「force push の見分け方」（見分けられない push は更新とし、事実の `fastForward` を `unknown` にする）、2026-11-11 確認
+- GitHub Docs「Compare two commits」（`GET /repos/{owner}/{repo}/compare/{basehead}` の `status` は ahead・behind・identical・diverged で、応答に 404 Resource not found がある。https://docs.github.com/en/rest/commits/commits#compare-two-commits 、2026-11-11 確認）
 - GitHub Docs「Forming calls with GraphQL」（GitHub の GraphQL の操作は query と mutation の 2 種類、https://docs.github.com/en/graphql/guides/forming-calls-with-graphql 、2026-11-09 確認）
