@@ -166,6 +166,10 @@ func Open(path string, out io.Writer) (*Log, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := createSeen(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Log{db: db, out: out}, nil
 }
 
