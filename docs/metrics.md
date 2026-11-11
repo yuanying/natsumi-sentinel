@@ -35,7 +35,8 @@
 | `sentinel_audit_write_failures_total` | counter | `stage`（`begin`・`write`・`finish`） | 記録を書けなかった数 |
 | `sentinel_routes_reload_failures_total` | counter | なし | 振り分けを読み直して採れなかった数（前の振り分けのまま動いている） |
 | `sentinel_upstream_failures_total` | counter | `destination`・`reason` | 関所が通した要求で、上流の答えが得られなかった数 |
-| `sentinel_notices_total` | counter | `type`（`first-seen`・`daily-summary`） | 作った知らせの数。送れたかどうかによらない |
+| `sentinel_approvals_pending` | gauge | なし | 本人の答えを待っている承認待ちの数。台帳から、scrape のたびに数える |
+| `sentinel_notices_total` | counter | `type`（`first-seen`・`answer`・`daily-summary`） | 作った知らせの数。送れたかどうかによらない |
 | `sentinel_notice_send_failures_total` | counter | なし | 待っている知らせを送ろうとして送れなかった回数。送り直す |
 | `sentinel_notices_pending` | gauge | なし | 送るのを待っている知らせの数 |
 | `sentinel_notices_dropped_total` | counter | なし | 待ちが上限を超えて、送らずに捨てた知らせの数 |
@@ -51,11 +52,17 @@
 | `kind` | 記録の `kind`。`http`・`connection`・`passthrough`・`dns`・`gate`。振り分けの読み直し（`config`）は数えない |
 | `treatment` | 記録の `treatment`。`open`・`passthrough`・`deny`、当てはまらなければ空 |
 | `destination` | 上の「label の決まり」のとおり |
-| `verdict` | 記録の `verdict`。どう決めたか。今は `allow`・`deny` で、判定の版で ask と許しが足される |
+| `verdict` | 記録の `verdict`。どう決めたか。`allow`・`ask`・`deny`。許しに当たって通ったものは `allow` |
 
 - 数えるのは、記録を書き終えたときである。上流へ渡す前に書く記録（[関所の記録](audit.md)の「書く時」）は、答えを流し終えて書き足したときに 1 つ数える。
 - 記録を書けずに通さなかったものは数えない（それは `sentinel_audit_write_failures_total` に出る）。
 - deny と ask の数は、`verdict` で絞って読む。
+
+### `sentinel_approvals_pending`
+
+- 数えるのは、台帳の承認待ちのうち、まだ答えが無く（`open`）、期限を過ぎていないものである。期限を過ぎたものは、台帳の掃除（1 分ごと）がまだ閉じていなくても数えない。
+- 承認待ちにした要求も、作業環境が先に頼んだことも、1 つの承認待ちを 1 と数える。同じ要求を何度まとめても 1 である。
+- 台帳が読めなかった scrape では、この series を出さない。ほかの指標は出る。規則では `absent` で拾える。
 
 ### `sentinel_upstream_failures_total` の `reason`
 
@@ -87,7 +94,7 @@
 |---|---|
 | 要求の数（宛先・扱い・決め方ごと） | `sentinel_requests_total` |
 | deny と ask の数 | `sentinel_requests_total` の `verdict` |
-| 承認待ちの数 | まだ無い。台帳ができる判定の版で足す |
+| 承認待ちの数 | `sentinel_approvals_pending` |
 | 設定の読み直しの失敗 | `sentinel_routes_reload_failures_total` |
 | 記録の書き込みの失敗 | `sentinel_audit_write_failures_total` |
 | 上流への失敗 | `sentinel_upstream_failures_total` |
