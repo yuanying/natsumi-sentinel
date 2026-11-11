@@ -452,3 +452,14 @@ func TestAMergeAskedForBeforehandOnGitHubTakesItsHeadSHAAndTheRepositoryWithoutC
 		t.Errorf("a merge without its SHA = %d %v", code, out)
 	}
 }
+
+func TestTheParametersOfAnApprovalAreWrittenWithNameAndValue(t *testing.T) {
+	e := newEnv(t)
+	_, out := e.do(e.agent, "POST", "/v1/approvals", `{"items":[
+		{"destination":"api.example.com","operation":"pulls.merge","params":{"owner":"o","repo":"r","number":"5"}}]}`)
+	item := list(out["items"])[0].(map[string]any)
+	p := list(item["params"])[0].(map[string]any)
+	if p["name"] != "owner" || p["value"] != "o" {
+		t.Errorf("params[0] = %v; want {name, value} as docs/approvals-api.md has it", p)
+	}
+}

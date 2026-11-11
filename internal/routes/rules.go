@@ -34,7 +34,8 @@ type segment struct {
 
 // Param is one parameter a rule read from the path.
 type Param struct {
-	Name, Value string
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // Match is a request matched to an operation by a rule.
