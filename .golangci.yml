@@ -3,6 +3,12 @@
 # leave the reason beside it.
 version: "2"
 
+# The tests that need root and a network namespace sit behind this tag.
+# Lint them too, though `make test` does not run them.
+run:
+  build-tags:
+    - netns
+
 linters:
   default: standard
 

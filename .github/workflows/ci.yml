@@ -34,6 +34,19 @@ jobs:
       - run: make vet
       - run: make test
 
+  # The tests that redirect real connections with iptables. The runner
+  # gives sudo, and the tests run in a network namespace of their own.
+  netns:
+    name: netns
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make test-netns
+
   lint:
     name: lint
     runs-on: ubuntu-latest
