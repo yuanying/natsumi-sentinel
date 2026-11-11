@@ -7,6 +7,7 @@ package e2e_test
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -22,12 +23,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yuanying/natsumi-sentinel/internal/approvals"
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
 	"github.com/yuanying/natsumi-sentinel/internal/authd"
 	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/certs"
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
+	"github.com/yuanying/natsumi-sentinel/internal/ledger"
 	"github.com/yuanying/natsumi-sentinel/internal/peercred"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 	"github.com/yuanying/natsumi-sentinel/internal/testca"
@@ -45,21 +48,37 @@ const routesYAML = `
 destinations:
   - name: example.com
     treatment: open
-    default: allow
+    default: ask
+    rules:
+      - operation: read
+        methods: [GET]
+      - operation: issues.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/issues
+      - operation: repos.delete
+        methods: [DELETE]
+        path: /repos/{owner}/{repo}
+    operations:
+      read: allow
+      repos.delete: deny
   - name: unregistered.example.com
     treatment: open
     default: allow
 `
 
 type world struct {
-	t   *testing.T
-	ca  *testca.CA
-	log *audit.Log
+	t      *testing.T
+	ca     *testca.CA
+	log    *audit.Log
+	ledger *ledger.Ledger
+	owner  http.Handler
 
 	mu   sync.Mutex
 	seen []*http.Request
 
-	gateAddr string
+	gateAddr  string
+	routesDir string
+	watcher   *routes.Watcher
 }
 
 func newWorld(t *testing.T) *world {
@@ -136,6 +155,7 @@ credentials:
 	if err != nil {
 		t.Fatal(err)
 	}
+	w.routesDir, w.watcher = routesDir, watcher
 	minter, err := certs.Load(w.ca.CertFile, w.ca.KeyFile)
 	if err != nil {
 		t.Fatal(err)
@@ -146,10 +166,17 @@ credentials:
 	}
 	t.Cleanup(func() { _ = w.log.Close() })
 
+	w.ledger, err = ledger.Open(filepath.Join(dir, "ledger.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.ledger.Close() })
+	w.owner = approvals.Owner(approvals.OwnerConfig{Ledger: w.ledger, Log: w.log})
+
 	g := gate.New(gate.Config{
 		Source:   "workspace",
 		Routes:   watcher.Current,
-		Decider:  decide.Table{},
+		Decider:  decide.Table{Ledger: w.ledger},
 		Minter:   minter,
 		Log:      w.log,
 		Upstream: tr,
@@ -232,7 +259,7 @@ func (w *world) lastRecord() *audit.Record {
 func TestAnAllowedRequestGoesThroughAuthdWithTheRealKeyToTheUpstream(t *testing.T) {
 	w := newWorld(t)
 	// The tool writes the Host without the port, as most do for 443.
-	resp, body := w.do("POST", "https://example.com/repos/o/r/issues", `{"title":"hi"}`)
+	resp, body := w.do("GET", "https://example.com/repos/o/r", "")
 	if resp.StatusCode != http.StatusCreated || body != "from upstream" {
 		t.Fatalf("response = %d %q, want the upstream's 201", resp.StatusCode, body)
 	}
@@ -244,7 +271,79 @@ func TestAnAllowedRequestGoesThroughAuthdWithTheRealKeyToTheUpstream(t *testing.
 		t.Errorf("the upstream got Authorization %q, want the real key", got)
 	}
 	rec := w.lastRecord()
-	if rec.Verdict != audit.Allow || rec.Status != http.StatusCreated || rec.Request == nil || rec.Request.Text != `{"title":"hi"}` {
+	if rec.Verdict != audit.Allow || rec.Status != http.StatusCreated || rec.Operation != "read" {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
+// answer answers an approval on the owner's door, as natsumi's server does.
+func (w *world) answer(id, body string) map[string]any {
+	w.t.Helper()
+	rr := httptest.NewRecorder()
+	w.owner.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/approvals/"+id+"/answer", strings.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		w.t.Fatalf("answer = %d %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	return out
+}
+
+func TestAnAskedRequestGoesThroughWhenMadeAgainOnceTheOwnerAllowsIt(t *testing.T) {
+	w := newWorld(t)
+	const body = `{"title":"hi"}`
+	resp, text := w.do("POST", "https://example.com/repos/o/r/issues", body)
+	if resp.StatusCode != http.StatusForbidden || resp.Header.Get(gate.MarkHeader) != gate.MarkAsk {
+		t.Fatalf("first try = %d %q, want the gate's ask", resp.StatusCode, text)
+	}
+	id := resp.Header.Get(gate.ApprovalHeader)
+	if id == "" || !strings.Contains(text, id) {
+		t.Fatalf("no approval id: %q", text)
+	}
+	if n := len(w.upstreamSaw()); n != 0 {
+		t.Fatalf("the upstream saw %d requests before the answer", n)
+	}
+	// Asking again before the answer is the same approval.
+	resp, _ = w.do("POST", "https://example.com/repos/o/r/issues", body)
+	if got := resp.Header.Get(gate.ApprovalHeader); got != id {
+		t.Errorf("the second try was held as %q, want %q", got, id)
+	}
+
+	w.answer(id, `{"answer":"allow","choice":"once"}`)
+
+	resp, text = w.do("POST", "https://example.com/repos/o/r/issues", body)
+	if resp.StatusCode != http.StatusCreated || text != "from upstream" {
+		t.Fatalf("after the answer = %d %q, want the upstream's 201", resp.StatusCode, text)
+	}
+	seen := w.upstreamSaw()
+	if len(seen) != 1 || seen[0].Header.Get("Authorization") != "Bearer "+realKey {
+		t.Fatalf("the upstream saw %d requests: %+v", len(seen), seen)
+	}
+	rec := w.lastRecord()
+	if rec.Verdict != audit.Allow || rec.Grant == "" || rec.Operation != "issues.create" || rec.Target != "owner=o repo=r" || rec.Request.Text != body {
+		t.Errorf("record = %+v", rec)
+	}
+	// The grant was for one request.
+	resp, _ = w.do("POST", "https://example.com/repos/o/r/issues", body)
+	if resp.StatusCode != http.StatusForbidden || resp.Header.Get(gate.MarkHeader) != gate.MarkAsk {
+		t.Errorf("a third try = %d, want it asked again", resp.StatusCode)
+	}
+	answers, _ := w.log.List(context.Background(), audit.Query{Kind: audit.KindAnswer})
+	if len(answers) != 1 || answers[0].Approval != id {
+		t.Errorf("the answer's records = %+v", answers)
+	}
+}
+
+func TestADeniedOperationIsRefusedWithoutReachingAuthd(t *testing.T) {
+	w := newWorld(t)
+	resp, text := w.do("DELETE", "https://example.com/repos/o/r", "")
+	if resp.StatusCode != http.StatusForbidden || resp.Header.Get(gate.MarkHeader) != gate.MarkDeny || !strings.Contains(text, "table") {
+		t.Fatalf("response = %d %q, want the gate's deny", resp.StatusCode, text)
+	}
+	if n := len(w.upstreamSaw()); n != 0 {
+		t.Errorf("the upstream saw %d requests", n)
+	}
+	if rec := w.lastRecord(); rec.Verdict != audit.Deny || rec.Operation != "repos.delete" {
 		t.Errorf("record = %+v", rec)
 	}
 }
@@ -261,5 +360,26 @@ func TestARefusalByAuthdIsRecordedWithItsReasonAndNothingReachesTheUpstream(t *t
 	rec := w.lastRecord()
 	if rec.AuthdReason != string(authdclient.ReasonUpstreamNotRegistered) {
 		t.Errorf("record = %+v, want authd's reason", rec)
+	}
+}
+
+func TestATableTurnedToDenyWinsOverAGrant(t *testing.T) {
+	w := newWorld(t)
+	resp, _ := w.do("POST", "https://example.com/repos/o/r/issues", `{}`)
+	w.answer(resp.Header.Get(gate.ApprovalHeader), `{"answer":"allow","choice":"forever"}`)
+	if resp, _ := w.do("POST", "https://example.com/repos/o/r/issues", `{"other":1}`); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("with the grant = %d, want it through", resp.StatusCode)
+	}
+
+	denied := strings.Replace(routesYAML, "      repos.delete: deny", "      repos.delete: deny\n      issues.create: deny", 1)
+	if err := os.WriteFile(filepath.Join(w.routesDir, "routes.yaml"), []byte(denied), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := w.watcher.Check(); !changed || err != nil {
+		t.Fatalf("the table was not read again: %v, %v", changed, err)
+	}
+	resp, text := w.do("POST", "https://example.com/repos/o/r/issues", `{"other":1}`)
+	if resp.StatusCode != http.StatusForbidden || resp.Header.Get(gate.MarkHeader) != gate.MarkDeny {
+		t.Errorf("after the table denies = %d %q, want the gate's deny", resp.StatusCode, text)
 	}
 }

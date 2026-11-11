@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -48,7 +49,7 @@ destinations:
 `
 
 type setup struct {
-	config, db, authd string
+	config, db, authd, ledger, approvals string
 	ca         *testca.CA
 }
 
@@ -58,7 +59,18 @@ func newSetup(t *testing.T) setup {
 	if err := os.WriteFile(filepath.Join(config, "routes.yaml"), []byte(routesYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return setup{config: config, db: filepath.Join(t.TempDir(), "audit.db"), authd: filepath.Join(t.TempDir(), "authd.sock"), ca: testca.New(t)}
+	// Unix socket paths have to be short.
+	sockDir, err := os.MkdirTemp("", "sentinel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	data := t.TempDir()
+	return setup{
+		config: config, db: filepath.Join(data, "audit.db"), ledger: filepath.Join(data, "ledger.db"),
+		authd: filepath.Join(sockDir, "authd.sock"), approvals: filepath.Join(sockDir, "approvals.sock"),
+		ca: testca.New(t),
+	}
 }
 
 func (s setup) args(extra ...string) []string {
@@ -68,6 +80,9 @@ func (s setup) args(extra ...string) []string {
 		"-ca-key", s.ca.KeyFile,
 		"-db", s.db,
 		"-authd-socket", s.authd,
+		"-ledger", s.ledger,
+		"-approvals-socket", s.approvals,
+		"-approvals-peer-uid", strconv.Itoa(os.Getuid()),
 		"-source", "name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0",
 	}, extra...)
 }
@@ -115,6 +130,28 @@ func TestWithoutAnAuthdSocketItIsAUsageError(t *testing.T) {
 	}
 }
 
+func TestWithoutTheLedgerOrTheApprovalsSocketItIsAUsageError(t *testing.T) {
+	for _, flag := range []string{"-ledger", "-approvals-socket", "-approvals-peer-uid"} {
+		t.Run(flag, func(t *testing.T) {
+			s := newSetup(t)
+			args := s.args()
+			for i, a := range args {
+				if a == flag {
+					args = append(args[:i:i], args[i+2:]...)
+					break
+				}
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), args, &stdout, &stderr); code != 2 {
+				t.Fatalf("run = %d, want 2", code)
+			}
+			if !strings.Contains(stderr.String(), flag) {
+				t.Errorf("stderr = %q, want it to name %s", stderr.String(), flag)
+			}
+		})
+	}
+}
+
 func TestTheUpstreamIsAuthdAtItsSocket(t *testing.T) {
 	var got string
 	old := newUpstream
@@ -152,6 +189,14 @@ func TestItDoesNotStartWithoutWhatItNeeds(t *testing.T) {
 		},
 		"an audit log that cannot be opened": func(s *setup) []string {
 			s.db = filepath.Join(t.TempDir(), "missing", "audit.db")
+			return s.args()
+		},
+		"a ledger that cannot be opened": func(s *setup) []string {
+			s.ledger = filepath.Join(t.TempDir(), "missing", "ledger.db")
+			return s.args()
+		},
+		"an approvals socket that cannot be listened on": func(s *setup) []string {
+			s.approvals = filepath.Join(t.TempDir(), "missing", "approvals.sock")
 			return s.args()
 		},
 	}
@@ -207,7 +252,7 @@ func TestWithAnUpstreamItServesTheSourceAndRecordsUntilStopped(t *testing.T) {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		l.addrs[source+"/"+what] = addr
-		if len(l.addrs) == 3 {
+		if len(l.addrs) == 4 {
 			close(l.ready)
 		}
 	}
@@ -255,6 +300,20 @@ func TestWithAnUpstreamItServesTheSourceAndRecordsUntilStopped(t *testing.T) {
 	}
 	if a := m.Answers[0].Body.(*dnsmessage.AResource).A; a != [4]byte{192, 0, 2, 53} {
 		t.Errorf("the gate's name = %v, want 192.0.2.53", a)
+	}
+
+	// The owner's door answers on its socket.
+	oc := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", s.approvals)
+	}}, Timeout: 5 * time.Second}
+	resp, err := oc.Get("http://sentinel/v1/approvals")
+	if err != nil {
+		t.Fatalf("the approvals socket: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("GET /v1/approvals on the socket = %d", resp.StatusCode)
 	}
 
 	cancel()

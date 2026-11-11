@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yuanying/natsumi-sentinel/internal/approvals"
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
 	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/buildinfo"
@@ -35,7 +36,9 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/dnsgate"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
+	"github.com/yuanying/natsumi-sentinel/internal/ledger"
 	"github.com/yuanying/natsumi-sentinel/internal/origdst"
+	"github.com/yuanying/natsumi-sentinel/internal/peercred"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
 
@@ -100,7 +103,9 @@ func (s *sourceFlag) Set(v string) error {
 
 type options struct {
 	config, caCert, caKey, db string
-	authdSocket               string
+	authdSocket, ledger       string
+	approvalsSocket           string
+	approvalsUID              int
 	sources                   sourceFlag
 	gateName, gateAddress     string
 	reload                    time.Duration
@@ -117,8 +122,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.caKey, "ca-key", "", "the gate's CA private key, PEM")
 	fs.StringVar(&o.db, "db", "", "the SQLite file of the audit log; its directory must exist")
 	fs.StringVar(&o.authdSocket, "authd-socket", "", "authd's Unix socket, where requests on open destinations are handed on")
+	fs.StringVar(&o.ledger, "ledger", "", "the SQLite file of the ledger of approvals and grants; its directory must exist")
+	fs.StringVar(&o.approvalsSocket, "approvals-socket", "", "the Unix socket the owner's door (natsumi's server) is served on")
+	fs.IntVar(&o.approvalsUID, "approvals-peer-uid", -1, "the server's UID, the only one taken on -approvals-socket")
 	fs.Var(&o.sources, "source", "a listener pair, name=NAME,proxy=ADDR,dns=ADDR; repeat for each place redirected from")
-	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution")
+	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution; the workspace's door is http://NAME/")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	if err := fs.Parse(args); err != nil {
@@ -167,6 +175,12 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 		return nil, errors.New("-db is required")
 	case o.authdSocket == "":
 		return nil, errors.New("-authd-socket is required")
+	case o.ledger == "":
+		return nil, errors.New("-ledger is required")
+	case o.approvalsSocket == "":
+		return nil, errors.New("-approvals-socket is required")
+	case o.approvalsUID < 0:
+		return nil, errors.New("-approvals-peer-uid is required")
 	case len(o.sources) == 0:
 		return nil, errors.New("at least one -source is required")
 	case o.reload <= 0:
@@ -201,7 +215,13 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		return err
 	}
 	defer func() { _ = log.Close() }()
+	book, err := ledger.Open(o.ledger, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = book.Close() }()
 	upstream := newUpstream(o.authdSocket)
+	decider := decide.Table{Ledger: book}
 
 	var (
 		closers []func() error
@@ -213,17 +233,44 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		}
 		wg.Wait()
 	}()
+	ol, err := peercred.Listen(o.approvalsSocket, o.approvalsUID, func(uid int) {
+		logger.Warn("refused a connection to the approvals socket from another UID", "uid", uid)
+	})
+	if err != nil {
+		return fmt.Errorf("the approvals socket: %w", err)
+	}
+	owner := &http.Server{
+		Handler:           approvals.Owner(approvals.OwnerConfig{Ledger: book, Log: log}),
+		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
+	closers = append(closers, owner.Close)
+	onListen("", "approvals", ol.Addr())
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := owner.Serve(ol); !errors.Is(err, http.ErrServerClosed) {
+			logIf(logger, err)
+		}
+	}()
+
 	for _, src := range o.sources {
-		g := gate.New(gate.Config{
+		cfg := gate.Config{
 			Source:      src.name,
 			Routes:      watcher.Current,
-			Decider:     decide.Table{},
+			Decider:     decider,
 			Minter:      minter,
 			Log:         log,
 			Upstream:    upstream,
 			OriginalDst: origdst.Lookup,
 			Logger:      logger.With("source", src.name),
-		})
+		}
+		for name, addr := range fixed {
+			cfg.AgentAddr = netip.AddrPortFrom(addr, 80)
+			cfg.StatusURL = "http://" + name + "/v1/status"
+			cfg.Agent = approvals.Agent(approvals.AgentConfig{Source: src.name, Ledger: book, Log: log, Routes: watcher.Current})
+		}
+		g := gate.New(cfg)
 		closers = append(closers, g.Close)
 		ln, err := net.Listen("tcp", src.proxy)
 		if err != nil {
@@ -259,7 +306,13 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		go func() { defer wg.Done(); logIf(logger, dns.ServeTCP(tl)) }()
 	}
 
-	wg.Add(2)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		book.RunSweeper(ctx, time.Minute, func(err error) {
+			logger.Error("the ledger could not be swept of what has ended", "error", err)
+		})
+	}()
 	go func() {
 		defer wg.Done()
 		watcher.Run(ctx, o.reload, func(err error) { recordReload(log, logger, err) })

@@ -217,6 +217,10 @@ func newEnv(t *testing.T, passthroughPort int) *env {
 		},
 		FirstByteTimeout: time.Second,
 		StatusURL:        "http://sentinel.internal/v1/status",
+		AgentAddr:        netip.MustParseAddrPort("192.0.2.53:80"),
+		Agent: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "the agent door: "+r.Method+" "+r.URL.Path)
+		}),
 	})
 	go func() { _ = g.Serve(ln) }()
 	t.Cleanup(func() { _ = g.Close() })
@@ -666,6 +670,50 @@ func TestPlainHTTPIsAnsweredByTheGateAndRecorded(t *testing.T) {
 	}
 	if n := len(e.up.requests()); n != 0 {
 		t.Errorf("upstream saw %d requests", n)
+	}
+}
+
+func TestPlainHTTPToTheGatesOwnAddressReachesTheWorkspacesDoor(t *testing.T) {
+	e := newEnv(t, 1)
+	e.setOrigDst("192.0.2.53:80")
+	c := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, e.addr)
+		},
+	}, Timeout: 5 * time.Second}
+	for i := 0; i < 2; i++ {
+		resp, err := c.Get("http://sentinel.internal/v1/status")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 || string(body) != "the agent door: GET /v1/status" {
+			t.Errorf("response = %d %q", resp.StatusCode, body)
+		}
+	}
+	if n := len(e.up.requests()); n != 0 {
+		t.Errorf("upstream saw %d requests", n)
+	}
+}
+
+func TestTheGatesOwnAddressOnAnotherPortIsNotTheDoor(t *testing.T) {
+	e := newEnv(t, 1)
+	e.setOrigDst("192.0.2.53:8080")
+	c := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, e.addr)
+		},
+	}, Timeout: 5 * time.Second}
+	resp, err := c.Get("http://sentinel.internal:8080/v1/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || resp.Header.Get(gate.MarkHeader) != gate.MarkDeny {
+		t.Errorf("response = %d, want the gate's refusal of plain HTTP", resp.StatusCode)
 	}
 }
 
