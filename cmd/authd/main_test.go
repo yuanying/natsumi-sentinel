@@ -18,16 +18,20 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 )
 
-// waitForSocket waits for authd's socket to appear.
+// waitForSocket waits until authd takes connections on its socket. The
+// socket's file appears when it is bound, a moment before it is listened on:
+// a connection in between is refused, so the file alone is not enough.
 func waitForSocket(t *testing.T, socket string, stderr *syncBuffer) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := os.Stat(socket); err == nil {
+		c, err := net.Dial("unix", socket)
+		if err == nil {
+			_ = c.Close()
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the socket did not appear; stderr: %s", stderr.String())
+			t.Fatalf("the socket did not take a connection: %v; stderr: %s", err, stderr.String())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -137,16 +141,7 @@ func TestItServesOnTheSocketUntilItIsToldToStop(t *testing.T) {
 		done <- run(ctx, []string{"--config", config, "--socket", socket, "--peer-uid", strconv.Itoa(os.Getuid())}, &bytes.Buffer{}, stderr)
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(socket); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the socket did not appear; stderr: %s", stderr.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForSocket(t, socket, stderr)
 
 	tr := authdclient.NewTransport(socket)
 	defer tr.CloseIdleConnections()
@@ -195,8 +190,10 @@ func TestTheMetricsCountRefusalsByReason(t *testing.T) {
 	tr := authdclient.NewTransport(socket)
 	defer tr.CloseIdleConnections()
 	req, _ := http.NewRequest(http.MethodGet, "https://nowhere.example.com/", nil)
-	if _, err := tr.RoundTrip(req); err == nil {
-		t.Fatal("an unregistered upstream was not refused")
+	_, err := tr.RoundTrip(req)
+	var aerr *authdclient.Error
+	if !errors.As(err, &aerr) || aerr.Reason != authdclient.ReasonUpstreamNotRegistered {
+		t.Fatalf("RoundTrip = %v, want authd to refuse an unregistered upstream", err)
 	}
 
 	resp, err := http.Get("http://" + addr.String() + "/metrics")
