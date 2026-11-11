@@ -175,13 +175,13 @@ func TestHiddenEntriesThatAConfigMapMountLeavesAreSkipped(t *testing.T) {
 
 func TestATableThatCannotBeUsedIsRefused(t *testing.T) {
 	tests := map[string]map[string]string{
-		"a directory with no routing file":      {"README.txt": "nothing"},
-		"a file that is not YAML":               {"routes.yaml": "destinations: [::"},
-		"a field nobody knows":                  {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: allow\n    surprise: 1\n"},
-		"a treatment nobody knows":              {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: inspect\n"},
-		"an open destination without a default": {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n"},
+		"a directory with no routing file":         {"README.txt": "nothing"},
+		"a file that is not YAML":                  {"routes.yaml": "destinations: [::"},
+		"a field nobody knows":                     {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: allow\n    surprise: 1\n"},
+		"a treatment nobody knows":                 {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: inspect\n"},
+		"an open destination without a default":    {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n"},
 		"a default that is not allow, ask or deny": {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: maybe\n"},
-		"a deny destination with a default":     {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: deny\n    default: allow\n"},
+		"a deny destination with a default":        {"routes.yaml": "destinations:\n  - name: a.example.com\n    treatment: deny\n    default: allow\n"},
 		"a name given twice across files": {
 			"a.yaml": "destinations:\n  - name: a.example.com\n    treatment: open\n    default: allow\n",
 			"b.yaml": "destinations:\n  - name: A.example.com.\n    treatment: deny\n",
@@ -195,9 +195,9 @@ func TestATableThatCannotBeUsedIsRefused(t *testing.T) {
 			"a.yaml": "audit:\n  retentionDays: 1\n",
 			"b.yaml": "audit:\n  retentionDays: 2\n",
 		},
-		"a retention that is not positive": {"routes.yaml": "audit:\n  retentionDays: 0\n"},
-		"a body limit that is negative":    {"routes.yaml": "audit:\n  bodyLimitBytes: -1\n"},
-		"a rule without an operation":      {"routes.yaml": open + "    rules:\n      - path: /a\n"},
+		"a retention that is not positive":              {"routes.yaml": "audit:\n  retentionDays: 0\n"},
+		"a body limit that is negative":                 {"routes.yaml": "audit:\n  bodyLimitBytes: -1\n"},
+		"a rule without an operation":                   {"routes.yaml": open + "    rules:\n      - path: /a\n"},
 		"a rule whose path does not start with a slash": {"routes.yaml": open + "    rules:\n      - operation: x\n        path: a/b\n"},
 		"a rule with a parameter given twice":           {"routes.yaml": open + "    rules:\n      - operation: x\n        path: /{a}/{a}\n"},
 		"a rest parameter that is not last":             {"routes.yaml": open + "    rules:\n      - operation: x\n        path: /{a...}/b\n"},

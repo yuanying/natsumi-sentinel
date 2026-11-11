@@ -50,7 +50,7 @@ destinations:
 
 type setup struct {
 	config, db, authd, ledger, approvals string
-	ca         *testca.CA
+	ca                                   *testca.CA
 }
 
 func newSetup(t *testing.T) setup {

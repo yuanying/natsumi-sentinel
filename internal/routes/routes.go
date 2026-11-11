@@ -134,9 +134,9 @@ func Normalize(name string) string {
 // The shape of one file.
 type file struct {
 	Destinations []struct {
-		Name      string `yaml:"name"`
-		Treatment string `yaml:"treatment"`
-		Default   string `yaml:"default"`
+		Name       string            `yaml:"name"`
+		Treatment  string            `yaml:"treatment"`
+		Default    string            `yaml:"default"`
 		Ports      []int             `yaml:"ports"`
 		Rules      []rawRule         `yaml:"rules"`
 		Operations map[string]string `yaml:"operations"`

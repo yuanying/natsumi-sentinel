@@ -62,7 +62,7 @@ func TestARedirectedRequestIsHandedOnToTheNameItWasOpenedFor(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := gate.New(gate.Config{
-		Source: "workspace", Routes: w.Current, Decider: decide.Defaults{},
+		Source: "workspace", Routes: w.Current, Decider: decide.Table{},
 		Minter: minter, Log: log, Upstream: up, OriginalDst: origdst.Lookup,
 	})
 	go func() { _ = g.Serve(ln) }()
