@@ -60,7 +60,7 @@
 | 振り分けで `open` の名前の A | 本物の IPv4 の答え（TTL 30 秒） |
 | 振り分けで `open` の名前の A 以外（AAAA を含む） | NOERROR、答えなし |
 | 関所の固定の名前（`-gate-name`）の A | `-gate-address` |
-| それ以外の名前 | NXDOMAIN |
+| それ以外の名前（振り分けで deny の名前、振り分けに無い名前、`-dns-search-suffix` の接尾辞を付けた名前を含む） | NXDOMAIN |
 | `open` の名前が上流の DNS に無い | NXDOMAIN |
 | 上流の DNS が答えない | SERVFAIL |
 | 記録が書けない | SERVFAIL |

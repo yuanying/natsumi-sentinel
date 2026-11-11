@@ -77,6 +77,11 @@ destinations:
 
 func newServer(t *testing.T) (*dnsgate.Server, *memLog) {
 	t.Helper()
+	return newServerWith(t, nil)
+}
+
+func newServerWith(t *testing.T, suffixes []string) (*dnsgate.Server, *memLog) {
+	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "routes.yaml"), []byte(table), 0o600); err != nil {
 		t.Fatal(err)
@@ -96,8 +101,9 @@ func newServer(t *testing.T) (*dnsgate.Server, *memLog) {
 			}
 			return res.LookupNetIP(ctx, network, host)
 		}),
-		Fixed: map[string]netip.Addr{"sentinel.internal": netip.MustParseAddr("127.0.0.1")},
-		Log:   log,
+		Fixed:          map[string]netip.Addr{"sentinel.internal": netip.MustParseAddr("127.0.0.1")},
+		Log:            log,
+		SearchSuffixes: suffixes,
 	})
 	return s, log
 }
@@ -316,5 +322,58 @@ func TestANameTheTableDeniesAndANameNotInTheTableAreToldApartByTheReason(t *test
 	}
 	if denied.Treatment != "deny" || unlisted.Treatment != "deny" {
 		t.Errorf("treatments = %q, %q, want deny for both", denied.Treatment, unlisted.Treatment)
+	}
+}
+
+var searchSuffixes = []string{"ns.svc.cluster.example", ".svc.cluster.example.", "cluster.example"}
+
+func TestANameInTheTableWithASearchSuffixAddedIsRefusedAndToldAsSuch(t *testing.T) {
+	for _, name := range []string{
+		"api.example.com.ns.svc.cluster.example.",
+		"API.example.com.svc.cluster.example.",
+		"api.example.com.cluster.example.",
+		// A name the table denies is the workspace's tool searching too.
+		"blocked.example.com.ns.svc.cluster.example.",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, log := newServerWith(t, searchSuffixes)
+			m := parse(t, s.Answer(context.Background(), query(t, name, dnsmessage.TypeA)))
+			if m.RCode != dnsmessage.RCodeNameError || len(m.Answers) != 0 {
+				t.Errorf("answer = %v with %d records, want NXDOMAIN and none", m.RCode, len(m.Answers))
+			}
+			rec := log.last(t)
+			if rec.Verdict != audit.Deny || rec.Treatment != "deny" || rec.Reason != audit.ReasonDNSSearchSuffix {
+				t.Errorf("record = %+v, want it denied with %q", rec, audit.ReasonDNSSearchSuffix)
+			}
+			if !strings.HasPrefix(rec.Reason, "not an open destination in the routing table") {
+				t.Errorf("reason %q does not start as before", rec.Reason)
+			}
+		})
+	}
+}
+
+func TestANameNotInTheTableWithASearchSuffixAddedIsToldAsNotListed(t *testing.T) {
+	for _, name := range []string{
+		"made-up.example.net.ns.svc.cluster.example.",
+		"svc.cluster.example.",
+		"ns.svc.cluster.example.",
+		// The suffix has to be whole labels.
+		"api.example.comns.svc.cluster.example.",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, log := newServerWith(t, searchSuffixes)
+			s.Answer(context.Background(), query(t, name, dnsmessage.TypeA))
+			if rec := log.last(t); rec.Reason != audit.ReasonDNSNotListed {
+				t.Errorf("reason = %q, want %q", rec.Reason, audit.ReasonDNSNotListed)
+			}
+		})
+	}
+}
+
+func TestWithoutSearchSuffixesASuffixedNameIsNotListed(t *testing.T) {
+	s, log := newServer(t)
+	s.Answer(context.Background(), query(t, "api.example.com.ns.svc.cluster.example.", dnsmessage.TypeA))
+	if rec := log.last(t); rec.Reason != audit.ReasonDNSNotListed {
+		t.Errorf("reason = %q, want %q", rec.Reason, audit.ReasonDNSNotListed)
 	}
 }

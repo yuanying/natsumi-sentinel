@@ -70,6 +70,11 @@ const (
 	ReasonDNSDenied = "not an open destination in the routing table: the table denies the name"
 	// ReasonDNSNotListed is a name the routing table does not list.
 	ReasonDNSNotListed = "not an open destination in the routing table: the name is not in the table"
+	// ReasonDNSSearchSuffix is a name the routing table lists, with one of
+	// the cluster's search suffixes added: the workspace's resolver trying
+	// the search list before the name itself. It is not a notice's pair
+	// (docs/notices.md).
+	ReasonDNSSearchSuffix = "not an open destination in the routing table: a name in the table with a search suffix added"
 )
 
 // Body is what is kept of a request body: the text up to the limit, and the

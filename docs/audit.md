@@ -67,9 +67,13 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `the gate's own name` | `allow` | 関所の固定の名前（`-gate-name`） |
 | `an open destination in the routing table` | `allow` | 振り分けで開く宛先の名前 |
 | `not an open destination in the routing table: the table denies the name` | `deny` | 振り分けで `treatment: deny` と書いた名前 |
-| `not an open destination in the routing table: the name is not in the table` | `deny` | 振り分けに無い名前 |
+| `not an open destination in the routing table: a name in the table with a search suffix added` | `deny` | 振り分けにある名前に、`-dns-search-suffix` の接尾辞のどれかを付けた名前（下） |
+| `not an open destination in the routing table: the name is not in the table` | `deny` | 振り分けに無い名前（上に当たらないもの） |
 
-- どちらの断りも、知らせの組（`denied-name`）の取り方は同じである（[知らせ](notices.md)）。1 日のまとめの「断ったもの」は理由ごとに行を分けるので、2 つは別の行になる。
+- 表で deny の名前と表に無い名前の断りは、知らせの組（`denied-name`）の取り方が同じである（[知らせ](notices.md)）。1 日のまとめの「断ったもの」は理由ごとに行を分けるので、別の行になる。
+- 作業環境の名前解決は、`ndots` の設定によって、名前をそのまま引く前に search の接尾辞を付けた名前（`api.example.com.<名前空間>.svc.cluster.local` など）を順に引く。関所に `-dns-search-suffix`（繰り返せる。例は `svc.cluster.local` の類）でその接尾辞を教えると、接尾辞を 1 つ除いた名前が振り分けにある（扱いは問わない）問い合わせに、この理由を付ける。答えは NXDOMAIN のままで、記録にも残るが、知らせの組にはしない。
+- 接尾辞は名前の区切り（`.`）で合うときだけ除く。接尾辞を除いた名前が振り分けに無い問い合わせは、表に無い名前として扱い、知らせの組にもなる。作業環境が接尾辞を付けた名前で何かを持ち出そうとしても、知らせから消えない。
+- `-dns-search-suffix` を渡さなければ、接尾辞を付けた名前も表に無い名前として扱う（前の版と同じ）。
 
 ## 要求の本文
 

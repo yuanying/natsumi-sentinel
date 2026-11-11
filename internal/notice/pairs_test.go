@@ -77,6 +77,10 @@ func TestThePairsOfARecord(t *testing.T) {
 			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "made-up.example.net", Verdict: audit.Deny, Reason: audit.ReasonDNSNotListed},
 			"[denied-name=made-up.example.net]",
 		},
+		"a name in the table with a search suffix added is no pair": {
+			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "api.example.com.ns.svc.cluster.example", Verdict: audit.Deny, Reason: audit.ReasonDNSSearchSuffix},
+			"[]",
+		},
 		"a name answered is no pair": {
 			audit.Record{Kind: audit.KindDNS, Treatment: "open", Name: "api.example.com", Verdict: audit.Allow},
 			"[]",

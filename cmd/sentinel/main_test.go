@@ -263,7 +263,7 @@ func TestWithAnUpstreamItServesTheSourceAndRecordsUntilStopped(t *testing.T) {
 	done := make(chan int, 1)
 	var stdout, stderr syncBuffer
 	go func() {
-		done <- run(ctx, s.args("-gate-name", "sentinel.internal", "-gate-address", "192.0.2.53"), &stdout, &stderr)
+		done <- run(ctx, s.args("-gate-name", "sentinel.internal", "-gate-address", "192.0.2.53", "-dns-search-suffix", "svc.cluster.example"), &stdout, &stderr)
 	}()
 	select {
 	case <-l.ready:
@@ -355,4 +355,19 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+func TestASearchSuffixMustBeAName(t *testing.T) {
+	for _, suffix := range []string{"", ".", "with space.example", "a..example"} {
+		t.Run(suffix, func(t *testing.T) {
+			s := newSetup(t)
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), s.args("-dns-search-suffix", suffix), &stdout, &stderr); code != 2 {
+				t.Fatalf("run = %d, want 2; stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "-dns-search-suffix") {
+				t.Errorf("stderr %q does not name -dns-search-suffix", stderr.String())
+			}
+		})
+	}
 }

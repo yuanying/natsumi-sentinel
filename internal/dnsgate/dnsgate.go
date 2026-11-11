@@ -51,12 +51,19 @@ type Config struct {
 	TTL uint32
 	// Timeout bounds one lookup. Defaults to 5 seconds.
 	Timeout time.Duration
+	// SearchSuffixes are the search list of the workspace's resolver (the
+	// cluster's, such as svc.cluster.local). A refused query for a name in
+	// the table with one of them added is told by its own reason, which is
+	// not a notice's pair.
+	SearchSuffixes []string
 }
 
 // Server answers queries.
 type Server struct {
 	cfg   Config
 	fixed map[string]netip.Addr
+	// suffixes are the search suffixes, each with its leading dot.
+	suffixes []string
 }
 
 // New makes a Server.
@@ -77,7 +84,24 @@ func New(cfg Config) *Server {
 	for name, addr := range cfg.Fixed {
 		fixed[routes.Normalize(name)] = addr
 	}
-	return &Server{cfg: cfg, fixed: fixed}
+	var suffixes []string
+	for _, sfx := range cfg.SearchSuffixes {
+		if sfx = strings.TrimPrefix(routes.Normalize(sfx), "."); sfx != "" {
+			suffixes = append(suffixes, "."+sfx)
+		}
+	}
+	return &Server{cfg: cfg, fixed: fixed, suffixes: suffixes}
+}
+
+// searched reports whether name is a name in table with one of the search
+// suffixes added.
+func (s *Server) searched(table *routes.Table, name string) bool {
+	for _, sfx := range s.suffixes {
+		if base, ok := strings.CutSuffix(name, sfx); ok && base != "" && table.Listed(base) {
+			return true
+		}
+	}
+	return false
 }
 
 // ServeUDP answers queries on pc until it is closed.
@@ -193,8 +217,11 @@ func (s *Server) resolve(ctx context.Context, rec *audit.Record, name string, ty
 	if !table.Resolvable(name) {
 		rec.Treatment = string(routes.Closed)
 		rec.Verdict, rec.Reason = audit.Deny, audit.ReasonDNSNotListed
-		if table.Listed(name) {
+		switch {
+		case table.Listed(name):
 			rec.Reason = audit.ReasonDNSDenied
+		case s.searched(table, name):
+			rec.Reason = audit.ReasonDNSSearchSuffix
 		}
 		return dnsmessage.RCodeNameError, nil
 	}

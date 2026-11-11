@@ -114,6 +114,7 @@ type options struct {
 	approvalsUID              int
 	sources                   sourceFlag
 	gateName, gateAddress     string
+	searchSuffixes            listFlag
 	reload                    time.Duration
 	metrics                   string
 	notices                   noticeOptions
@@ -155,6 +156,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.Var(&o.sources, "source", "a listener pair, name=NAME,proxy=ADDR,dns=ADDR; repeat for each place redirected from")
 	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution; the workspace's door is http://NAME/")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
+	fs.Var(&o.searchSuffixes, "dns-search-suffix", "a search suffix of the workspace's resolver, such as svc.cluster.local; a refused name in the table with it added is recorded but not noticed; repeat for each")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
 	fs.StringVar(&o.notices.alertmanager, "alertmanager-url", "", "Alertmanager's https base URL, reached through authd, to send the notices to; empty only logs them")
@@ -219,6 +221,11 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 	case o.reload <= 0:
 		return nil, errors.New("-reload-interval must be positive")
 	}
+	for _, sfx := range o.searchSuffixes {
+		if !validSuffix(sfx) {
+			return nil, fmt.Errorf("-dns-search-suffix %q is not a name", sfx)
+		}
+	}
 	if (o.gateName == "") != (o.gateAddress == "") {
 		return nil, errors.New("-gate-name and -gate-address go together")
 	}
@@ -230,6 +237,22 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 		return nil, fmt.Errorf("-gate-address %q is not an IPv4 address", o.gateAddress)
 	}
 	return map[string]netip.Addr{o.gateName: addr}, nil
+}
+
+// validSuffix reports whether s is a name to take as a search suffix: dot
+// separated labels, none empty, with no white space. A leading or a
+// trailing dot is let be.
+func validSuffix(s string) bool {
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "."), ".")
+	if s == "" || strings.ContainsAny(s, " \t/:@") {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // start sets the gate up, failing closed on anything it cannot have, and
@@ -362,7 +385,10 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			Resolver: net.DefaultResolver,
 			Fixed:    fixed,
 			Log:      log,
-			Logger:   logger.With("source", src.name),
+			// The search suffixes are the resolver's, the same for
+			// every source of one Pod.
+			SearchSuffixes: o.searchSuffixes,
+			Logger:         logger.With("source", src.name),
 		})
 		pc, err := net.ListenPacket("udp", src.dns)
 		if err != nil {
