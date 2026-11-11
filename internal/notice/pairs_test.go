@@ -29,6 +29,34 @@ func TestThePairsOfARecord(t *testing.T) {
 			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "POST", Path: "/repos/o/r/issues", Query: "x=1", Verdict: audit.Allow},
 			"[destination=api.example.com write=api.example.com POST /repos/o/r/issues]",
 		},
+		"a write with an operation is its destination and the operation on its target": {
+			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "POST", Path: "/repos/o/r/issues/5/comments", Operation: "issues.comment", Target: "owner=o repo=r", Verdict: audit.Allow},
+			"[destination=api.example.com operation=api.example.com issues.comment owner=o repo=r]",
+		},
+		"a write with an operation and no target is its destination and the operation": {
+			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "PATCH", Path: "/user", Operation: "user.update", Verdict: audit.Allow},
+			"[destination=api.example.com operation=api.example.com user.update]",
+		},
+		"a read with an operation is its destination": {
+			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "GET", Path: "/repos/o/r", Operation: "read", Target: "owner=o repo=r", Verdict: audit.Allow},
+			"[destination=api.example.com]",
+		},
+		"a write let through on a grant is a pair like any other": {
+			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "PUT", Path: "/repos/o/r/pulls/5/merge", Operation: "pulls.merge", Target: "owner=o repo=r", Verdict: audit.Allow, Grant: "gr-1"},
+			"[destination=api.example.com operation=api.example.com pulls.merge owner=o repo=r]",
+		},
+		"a request held for the owner is no pair": {
+			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "PUT", Path: "/repos/o/r/pulls/5/merge", Operation: "pulls.merge", Target: "owner=o repo=r", Verdict: audit.Ask},
+			"[]",
+		},
+		"the owner's answer is no pair": {
+			audit.Record{Kind: audit.KindAnswer, Name: "api.example.com", Method: "PUT", Path: "/repos/o/r/pulls/5/merge", Operation: "pulls.merge", Verdict: audit.Allow},
+			"[]",
+		},
+		"asking beforehand is no pair": {
+			audit.Record{Kind: audit.KindAgent, Name: "api.example.com", Method: "POST", Path: "/v1/approvals", Operation: "pulls.merge", Verdict: audit.Ask},
+			"[]",
+		},
 		"a refused request is no pair": {
 			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "DELETE", Path: "/repos/o/r", Verdict: audit.Deny},
 			"[]",

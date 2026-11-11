@@ -13,6 +13,7 @@ package notice
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
@@ -43,9 +44,12 @@ const (
 	// PairDestination is a name in the routing table that a request went
 	// through to.
 	PairDestination = "destination"
-	// PairWrite is a write let through: its destination, method and
-	// path.
+	// PairWrite is a write of a raw operation let through: its
+	// destination, method and path.
 	PairWrite = "write"
+	// PairOperation is a write of a named operation let through: its
+	// destination, operation and target.
+	PairOperation = "operation"
 	// PairPassthrough is an address and port passed straight through.
 	PairPassthrough = "passthrough"
 	// PairDeniedName is a name refused in name resolution.
@@ -56,8 +60,10 @@ const (
 // record of something that was not let through is no pair, apart from a
 // name refused in name resolution.
 //
-// A write is its name, method and path: the records have no operation or
-// target of their own yet. The query is not part of it.
+// A write of a named operation is its name, operation and target, so that
+// one operation on one target is one pair whatever else is in its path. A
+// write of a raw operation is its name, method and path. The query is not
+// part of either.
 func Pairs(rec *audit.Record) []audit.Seen {
 	seen := func(pair, key string) audit.Seen {
 		return audit.Seen{Pair: pair, Key: key, First: rec.Time, Record: rec.ID}
@@ -65,7 +71,11 @@ func Pairs(rec *audit.Record) []audit.Seen {
 	switch {
 	case rec.Kind == audit.KindHTTP && rec.Verdict == audit.Allow:
 		out := []audit.Seen{seen(PairDestination, rec.Name)}
-		if isWrite(rec.Method) {
+		switch {
+		case !isWrite(rec.Method):
+		case rec.Operation != "":
+			out = append(out, seen(PairOperation, strings.Join(nonEmpty(rec.Name, rec.Operation, rec.Target), " ")))
+		default:
 			out = append(out, seen(PairWrite, rec.Name+" "+rec.Method+" "+rec.Path))
 		}
 		return out
