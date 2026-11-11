@@ -27,10 +27,20 @@ type Options struct {
 	// DialContext connects to an upstream by the name and port the gate
 	// gave. Nil uses the system's resolver and a plain TCP dial.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	// OnError is told the reason of each response authd makes itself: a
+	// refusal, or a failure to get the upstream's answer. Nil tells no one.
+	OnError func(authdclient.Reason)
+	// OnKeyUnreadable is told when a real key could not be read, by the
+	// credential's position in the registration (0 for the first). It
+	// never receives the key, the surrogate or the file's contents. Nil
+	// tells no one.
+	OnKeyUnreadable func(credential int)
 }
 
 type handler struct {
-	log *slog.Logger
+	log             *slog.Logger
+	onError         func(authdclient.Reason)
+	onKeyUnreadable func(int)
 	// routes is keyed by "name:port".
 	routes      map[string]*route
 	bySurrogate map[string]*credential
@@ -50,9 +60,17 @@ type route struct {
 // query, headers and body are the workspace's, with surrogates as they were.
 func NewHandler(cfg *Config, opts Options) (http.Handler, error) {
 	h := &handler{
-		log:         opts.Logger,
-		routes:      map[string]*route{},
-		bySurrogate: map[string]*credential{},
+		log:             opts.Logger,
+		onError:         opts.OnError,
+		onKeyUnreadable: opts.OnKeyUnreadable,
+		routes:          map[string]*route{},
+		bySurrogate:     map[string]*credential{},
+	}
+	if h.onError == nil {
+		h.onError = func(authdclient.Reason) {}
+	}
+	if h.onKeyUnreadable == nil {
+		h.onKeyUnreadable = func(int) {}
 	}
 	if h.log == nil {
 		h.log = slog.New(slog.DiscardHandler)
@@ -230,6 +248,7 @@ func (h *handler) swap(r *http.Request, upstreamName string) (authdclient.Reason
 		key, err := readKey(e.cred.keyFile)
 		if err != nil {
 			h.log.Error("cannot read a real key", "credential", e.cred.index, "error", err.Error())
+			h.onKeyUnreadable(e.cred.index)
 			return authdclient.ReasonCredentialUnavailable, "the real key for the surrogate cannot be read"
 		}
 		keys[e.cred] = key
@@ -331,6 +350,7 @@ func (h *handler) holdsSurrogate(header http.Header, rawQuery string) bool {
 
 func (h *handler) refuse(w http.ResponseWriter, authority string, reason authdclient.Reason, msg string) {
 	h.log.Info("refused", "upstream", authority, "reason", string(reason))
+	h.onError(reason)
 	authdclient.WriteError(w, &authdclient.Error{Reason: reason, Message: msg})
 }
 
@@ -344,6 +364,7 @@ func (h *handler) upstreamError(w http.ResponseWriter, r *http.Request, rt *rout
 	}
 	reason, msg := classify(err)
 	h.log.Warn("upstream failed", "upstream", rt.authority, "reason", string(reason))
+	h.onError(reason)
 	authdclient.WriteError(w, &authdclient.Error{Reason: reason, Message: msg})
 }
 

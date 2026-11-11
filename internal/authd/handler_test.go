@@ -64,6 +64,10 @@ type harness struct {
 	handle  http.HandlerFunc
 	reached int
 	dialed  []string
+	// errors are the reasons authd told its OnError of; unreadable the
+	// credentials it told its OnKeyUnreadable of.
+	errors     []authdclient.Reason
+	unreadable []int
 }
 
 func newHarness(t *testing.T) *harness {
@@ -131,6 +135,16 @@ credentials:
 	upstreamAddr := h.upstream.Listener.Addr().String()
 	handler, err := authd.NewHandler(cfg, authd.Options{
 		Logger: slog.New(slog.NewTextHandler(h.logs, nil)),
+		OnError: func(r authdclient.Reason) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.errors = append(h.errors, r)
+		},
+		OnKeyUnreadable: func(credential int) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.unreadable = append(h.unreadable, credential)
+		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			h.mu.Lock()
 			h.dialed = append(h.dialed, addr)
@@ -175,6 +189,12 @@ func (h *harness) reachedCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.reached
+}
+
+func (h *harness) told() ([]authdclient.Reason, []int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]authdclient.Reason(nil), h.errors...), append([]int(nil), h.unreadable...)
 }
 
 func (h *harness) dialedAddrs() []string {
@@ -617,5 +637,44 @@ func TestASurrogateOutsideEveryRegisteredPlaceIsNotSentOn(t *testing.T) {
 	h.refusal(req, authdclient.ReasonSurrogateMismatch)
 	if n := h.reachedCount(); n != 0 {
 		t.Errorf("the upstream was reached %d times", n)
+	}
+}
+
+func TestEachRefusalAndFailureIsToldByItsReason(t *testing.T) {
+	h := newHarness(t)
+	h.refusal(h.request(http.MethodGet, "nowhere.example.com", "/", nil), authdclient.ReasonUpstreamNotRegistered)
+	req := h.request(http.MethodGet, "other.example.com", "/", nil)
+	req.Header.Set("Authorization", "Bearer "+testSurrogate)
+	h.refusal(req, authdclient.ReasonSurrogateMismatch)
+	h.refusal(h.request(http.MethodGet, "down.example.com", "/", nil), authdclient.ReasonUpstreamUnreachable)
+
+	resp, err := h.send(h.request(http.MethodGet, "api.example.com", "/", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	got, _ := h.told()
+	want := []authdclient.Reason{authdclient.ReasonUpstreamNotRegistered, authdclient.ReasonSurrogateMismatch, authdclient.ReasonUpstreamUnreachable}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("told %v, want %v (and nothing for the request that went through)", got, want)
+	}
+}
+
+func TestAKeyThatCannotBeReadIsToldByTheCredentialsPlace(t *testing.T) {
+	h := newHarness(t)
+	if err := os.Remove(h.keyPath); err != nil {
+		t.Fatal(err)
+	}
+	req := h.request(http.MethodGet, "api.example.com", "/", nil)
+	req.Header.Set("Authorization", "Bearer "+testSurrogate)
+	h.refusal(req, authdclient.ReasonCredentialUnavailable)
+
+	reasons, unreadable := h.told()
+	if fmt.Sprint(unreadable) != "[0]" {
+		t.Errorf("unreadable credentials told = %v, want [0] (the first in the registration)", unreadable)
+	}
+	if fmt.Sprint(reasons) != "[credential-unavailable]" {
+		t.Errorf("reasons told = %v, want [credential-unavailable]", reasons)
 	}
 }
