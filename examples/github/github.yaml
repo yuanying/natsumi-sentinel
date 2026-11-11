@@ -1,0 +1,184 @@
+# The first GitHub table (docs/adr/0005, "最初の表"), written in the gate's
+# format (docs/routes.md, docs/github.md). The machine account is the
+# made-up example-operator; the real table, with the real account and the
+# rest of the destinations, is kept by the environment's repository.
+#
+# Check it with: sentinel -check -config examples/github
+destinations:
+  - name: api.github.com
+    treatment: open
+    # A write no rule names is asked about.
+    default: ask
+    github:
+      graphql:
+        - field: mergePullRequest
+          operation: github.pr.merge
+          target: [owner, repo, number]
+        - field: enablePullRequestAutoMerge
+          operation: github.pr.merge
+          target: [owner, repo, number]
+        - field: createRef
+          args: {name: "refs/tags/{tag...}"}
+          operation: github.tag.create
+          target: [owner, repo, tag]
+        - field: deleteRef
+          operation: github.ref.delete
+        - field: createPullRequest
+          on: {headRepository_owner: example-operator}
+          operation: github.pr.create
+        - field: createIssue
+          operation: github.issue.create
+        - field: updateIssue
+          operation: github.issue.update
+        - field: addComment
+          operation: github.comment.create
+        - field: updateIssueComment
+          operation: github.comment.update
+        - field: addPullRequestReview
+          operation: github.review.create
+        - field: submitPullRequestReview
+          operation: github.review.submit
+        - field: addPullRequestReviewThread
+          operation: github.review.comment
+        - field: createRepository
+          args: {visibility: PRIVATE}
+          operation: github.repo.create.private
+        - field: createRepository
+          operation: github.repo.create.public
+        - field: updateRepository
+          operation: github.repo.settings
+    rules:
+      - operation: github.fork.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/forks
+      - operation: github.pr.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/pulls
+        body: {head: "example-operator:{branch...}"}
+      - operation: github.pr.merge
+        methods: [PUT]
+        path: /repos/{owner}/{repo}/pulls/{number}/merge
+        body: {sha: "{sha}"}
+        target: [owner, repo, number]
+      - operation: github.review.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/pulls/{number}/reviews
+      - operation: github.review.submit
+        methods: [POST]
+        path: /repos/{owner}/{repo}/pulls/{number}/reviews/{review}/events
+      - operation: github.review.comment
+        methods: [POST]
+        path: /repos/{owner}/{repo}/pulls/{number}/comments
+      - operation: github.issue.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/issues
+      - operation: github.issue.update
+        methods: [PATCH]
+        path: /repos/{owner}/{repo}/issues/{number}
+      - operation: github.comment.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/issues/{number}/comments
+      - operation: github.comment.update
+        methods: [PATCH]
+        path: /repos/{owner}/{repo}/issues/comments/{comment}
+      - operation: github.tag.create
+        methods: [POST]
+        path: /repos/{owner}/{repo}/git/refs
+        body: {ref: "refs/tags/{tag...}", sha: "{sha}"}
+        target: [owner, repo, tag]
+      - operation: github.ref.delete
+        methods: [DELETE]
+        path: /repos/{owner}/{repo}/git/refs/{ref...}
+      - operation: github.ref.force
+        methods: [PATCH]
+        path: /repos/{owner}/{repo}/git/refs/{ref...}
+        body: {force: "true"}
+      # The machine account's own repositories: private ones only.
+      - operation: github.repo.create.private
+        methods: [POST]
+        path: /user/repos
+        body: {private: "true"}
+      - operation: github.repo.create.public
+        methods: [POST]
+        path: /user/repos
+      - operation: github.user
+        methods: [POST, PUT, PATCH, DELETE]
+        path: /user
+      - operation: github.user
+        methods: [POST, PUT, PATCH, DELETE]
+        path: /user/{rest...}
+      - operation: github.actions.secrets
+        path: /repos/{owner}/{repo}/actions/secrets/{rest...}
+      - operation: github.actions.variables
+        path: /repos/{owner}/{repo}/actions/variables/{rest...}
+      - operation: github.actions.variables
+        path: /repos/{owner}/{repo}/actions/variables
+      - operation: github.actions.secrets
+        path: /repos/{owner}/{repo}/environments/{environment}/secrets/{rest...}
+      - operation: github.actions.variables
+        path: /repos/{owner}/{repo}/environments/{environment}/variables/{rest...}
+      - operation: github.hooks
+        path: /repos/{owner}/{repo}/hooks
+      - operation: github.hooks
+        path: /repos/{owner}/{repo}/hooks/{rest...}
+      - operation: github.keys
+        path: /repos/{owner}/{repo}/keys
+      - operation: github.keys
+        path: /repos/{owner}/{repo}/keys/{rest...}
+      - operation: github.collaborators
+        path: /repos/{owner}/{repo}/collaborators/{rest...}
+      - operation: github.repo.settings
+        methods: [PATCH, DELETE]
+        path: /repos/{owner}/{repo}
+    operations:
+      github.fork.create: allow
+      github.pr.create: allow
+      github.review.create: allow
+      github.review.submit: allow
+      github.review.comment: allow
+      github.issue.create: allow
+      github.issue.update: allow
+      github.comment.create: allow
+      github.comment.update: allow
+      github.repo.create.private: allow
+      github.pr.merge: ask
+      github.tag.create: ask
+      github.repo.create.public: deny
+      github.ref.delete: deny
+      github.ref.force: deny
+      github.user: deny
+      github.actions.secrets: deny
+      github.actions.variables: deny
+      github.hooks: deny
+      github.keys: deny
+      github.collaborators: deny
+      github.repo.settings: deny
+
+  - name: github.com
+    treatment: open
+    default: ask
+    github:
+      # Where the gate asks whether a push rewinds a branch.
+      api: api.github.com
+      pushes:
+        - operation: github.ref.delete
+          kinds: [delete]
+        - operation: github.tag.create
+          kinds: [create]
+          ref: refs/tags/{tag...}
+        - operation: github.push.protected
+          kinds: [force]
+          ref: refs/heads/main
+        - operation: github.push.protected
+          kinds: [force]
+          ref: refs/heads/master
+        # The machine account's own repositories (its forks and its
+        # private repositories).
+        - operation: github.push.own
+          kinds: [create, update, force]
+          repository: example-operator/{name}
+    operations:
+      github.push.own: allow
+      github.tag.create: ask
+      github.ref.delete: deny
+      github.push.protected: deny

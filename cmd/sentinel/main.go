@@ -38,6 +38,7 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/dnsgate"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
+	"github.com/yuanying/natsumi-sentinel/internal/github"
 	"github.com/yuanying/natsumi-sentinel/internal/ledger"
 	"github.com/yuanying/natsumi-sentinel/internal/metrics"
 	"github.com/yuanying/natsumi-sentinel/internal/notice"
@@ -253,7 +254,6 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	}
 	defer func() { _ = book.Close() }()
 	upstream := newUpstream(o.authdSocket)
-	decider := decide.Table{Ledger: book}
 
 	reg := metrics.NewRegistry(program, version)
 	var fixedNames []string
@@ -266,6 +266,9 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	// recorded.
 	var pairs *notice.Watcher
 	log := observe.NewRecorder(db, gm.Observe, func(ev observe.Event) { pairs.Observe(ev) })
+	// The GitHub connector asks its questions through authd too, and
+	// records them as the gate's own (docs/adr/0005).
+	decider := decide.Table{Ledger: book, GitHub: &github.Connector{Transport: upstream, Log: log, Logger: logger.With("part", "github")}}
 	outbox, summary := setUpNotices(o.notices, notice.OutboxConfig{
 		Logger:     logger.With("part", "notices"),
 		Registerer: reg,
