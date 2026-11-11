@@ -31,10 +31,28 @@ const minSurrogateLen = 16
 type Config struct {
 	upstreams   []*upstream
 	credentials []*credential
+	unreadable  []UnreadableKey
 }
 
 // Credentials is how many credentials the registration holds.
 func (c *Config) Credentials() int { return len(c.credentials) }
+
+// UnreadableKey is a credential whose real key could not be read when the
+// registration was loaded. Requests that use it are refused until its file
+// can be read; nothing else is held up.
+type UnreadableKey struct {
+	// Credential is the credential's position in the registration.
+	Credential int
+	KeyFile    string
+	// Problem says why, never with the file's content.
+	Problem string
+}
+
+// UnreadableKeys are the credentials whose keys could not be read when the
+// registration was loaded, in the order of the registration.
+func (c *Config) UnreadableKeys() []UnreadableKey {
+	return append([]UnreadableKey(nil), c.unreadable...)
+}
 
 type upstream struct {
 	name  string
@@ -102,10 +120,12 @@ type rawPlace struct {
 // could be a surrogate put under the wrong field.
 var yamlValue = regexp.MustCompile("`[^`]*`")
 
-// LoadConfig reads and checks the registration at path. Every key file and
-// CA file it names has to be readable now: authd does not start on a
-// registration it cannot use. Errors name the field and the credential's
-// position, never a surrogate or a key.
+// LoadConfig reads and checks the registration at path. Every CA file it
+// names has to be readable now: authd does not start on a registration it
+// cannot use. A key file that cannot be read now does not stop the load; it
+// is told by UnreadableKeys, and the requests that use it are refused, as
+// they are when a key file cannot be read later. Errors name the field and
+// the credential's position, never a surrogate or a key.
 func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -151,6 +171,9 @@ func (raw *rawConfig) check() (*Config, error) {
 		}
 		seen[c.surrogate] = i
 		cfg.credentials = append(cfg.credentials, c)
+		if _, err := readKey(c.keyFile); err != nil {
+			cfg.unreadable = append(cfg.unreadable, UnreadableKey{Credential: i, KeyFile: c.keyFile, Problem: err.Error()})
+		}
 	}
 	return cfg, nil
 }
@@ -191,9 +214,6 @@ func (rc rawCredential) check(index int, upstreams map[string]*upstream) (*crede
 	}
 	if rc.KeyFile == "" {
 		return nil, errors.New("key_file is required")
-	}
-	if _, err := readKey(rc.KeyFile); err != nil {
-		return nil, fmt.Errorf("key_file %s: %w", rc.KeyFile, err)
 	}
 	c := &credential{index: index, surrogate: rc.Surrogate, keyFile: rc.KeyFile, upstreams: map[string]bool{}}
 	if len(rc.Upstreams) == 0 {

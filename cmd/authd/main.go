@@ -3,7 +3,8 @@
 // surrogates for their real keys on the way (docs/adr/0001, 0003).
 //
 // authd listens on a Unix socket and takes connections only from the gate's
-// UID. It does not start on a registration it cannot use.
+// UID. It does not start on a registration it cannot use, but a key file
+// that cannot be read only refuses the requests that use it.
 package main
 
 import (
@@ -82,6 +83,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	m := newAuthdMetrics(cfg.Credentials())
+	// A key that cannot be read does not stop the start: the requests that
+	// use it are refused, as they are when it cannot be read later.
+	for _, k := range cfg.UnreadableKeys() {
+		log.Warn("a real key cannot be read at the start; the requests that use it are refused until it can be",
+			"credential", k.Credential, "key_file", k.KeyFile, "error", k.Problem)
+		m.onKeyUnreadable(k.Credential)
+	}
 	handler, err := authd.NewHandler(cfg, authd.Options{
 		Logger:          log,
 		OnError:         m.onError,

@@ -144,25 +144,47 @@ func TestTheSameSurrogateTwiceDoesNotLoadAndTheErrorDoesNotShowIt(t *testing.T) 
 	}
 }
 
-func TestAMissingOrEmptyKeyFileStopsTheLoad(t *testing.T) {
-	t.Run("missing", func(t *testing.T) {
-		f := newFiles(t)
-		path := f.config(t)
-		if err := os.Remove(filepath.Join(f.dir, "key")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := authd.LoadConfig(path); err == nil {
-			t.Fatal("LoadConfig succeeded")
-		}
-	})
-	t.Run("empty", func(t *testing.T) {
-		f := newFiles(t)
-		path := f.config(t)
-		f.write(t, "key", "\n")
-		if _, err := authd.LoadConfig(path); err == nil {
-			t.Fatal("LoadConfig succeeded")
-		}
-	})
+func TestAKeyFileThatCannotBeReadDoesNotStopTheLoadAndIsToldByItsPosition(t *testing.T) {
+	for name, spoil := range map[string]func(t *testing.T, f files){
+		"missing": func(t *testing.T, f files) {
+			if err := os.Remove(filepath.Join(f.dir, "key")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"empty":             func(t *testing.T, f files) { f.write(t, "key", "\n") },
+		"control character": func(t *testing.T, f files) { f.write(t, "key", testKey+"\x01") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFiles(t)
+			path := f.config(t)
+			spoil(t, f)
+			cfg, err := authd.LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			got := cfg.UnreadableKeys()
+			if len(got) != 1 || got[0].Credential != 0 {
+				t.Fatalf("UnreadableKeys = %+v, want the credential at 0", got)
+			}
+			if got[0].KeyFile != filepath.Join(f.dir, "key") {
+				t.Errorf("KeyFile = %q, want the file's path", got[0].KeyFile)
+			}
+			if got[0].Problem == "" || strings.Contains(got[0].Problem, testKey) {
+				t.Errorf("Problem = %q, want why, without the key", got[0].Problem)
+			}
+		})
+	}
+}
+
+func TestKeyFilesThatCanBeReadAreNotTold(t *testing.T) {
+	f := newFiles(t)
+	cfg, err := authd.LoadConfig(f.config(t))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := cfg.UnreadableKeys(); len(got) != 0 {
+		t.Errorf("UnreadableKeys = %+v, want none", got)
+	}
 }
 
 func TestACAFileThatHoldsNoCertificateStopsTheLoad(t *testing.T) {

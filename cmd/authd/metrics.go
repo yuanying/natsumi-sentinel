@@ -33,7 +33,7 @@ func newAuthdMetrics(credentials int) *authdMetrics {
 		}, []string{"reason"}),
 		keyFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "authd_key_read_failures_total",
-			Help: "Times a real key's file could not be read when it was to be used, by the credential's position in the registration (0 for the first).",
+			Help: "Times a real key's file could not be read, at the start or when it was to be used, by the credential's position in the registration (0 for the first).",
 		}, []string{"credential"}),
 		refusedPeers: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "authd_refused_peers_total",
