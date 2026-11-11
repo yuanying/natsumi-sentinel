@@ -25,7 +25,7 @@ natsumi-sentinel は、[natsumi](https://github.com/yuanying/natsumi) のイン�
 
 関所は `-check -config <ディレクトリ>` で振り分けと表を、authd は `--check --config <ファイル>` で登録を確かめられます。開く宛先の要求は、表で allow・ask・deny を決め、通すものを `-authd-socket` の authd へ渡します。authd へは最初の要求のときにつなぎ、つながらないあいだは、その要求を通しません。ask の要求は `-ledger` の台帳に承認待ちとして残り、本人の答えは `-approvals-socket`（`-approvals-peer-uid` の UID だけが使える）で受けます。
 
-振り分けと表の形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md)、承認を受け付ける口と作業環境向けの口は [docs/approvals-api.md](docs/approvals-api.md) にあります。GitHub の API と git の要求を操作に揃えるコネクタの読み方は [docs/github.md](docs/github.md)、最初の表の見本は [examples/github/](examples/github/) にあります。
+向け直す元ごとの待ち受け（`-source`、IPv6 の `proxy6`・`dns6` を含む）と、環境の側で張る向け直しの規則は [docs/redirect.md](docs/redirect.md) にあります。振り分けと表の形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md)、承認を受け付ける口と作業環境向けの口は [docs/approvals-api.md](docs/approvals-api.md) にあります。GitHub の API と git の要求を操作に揃えるコネクタの読み方は [docs/github.md](docs/github.md)、最初の表の見本は [examples/github/](examples/github/) にあります。
 
 関所と authd は `-metrics-listen`（authd は `--metrics-listen`）で Prometheus の指標を出します。名前と label は [docs/metrics.md](docs/metrics.md) にあります。関所は、初めて見る宛先や書きの操作、本人の答え、1 日のまとめを、authd を通して Alertmanager に知らせます。形と、環境の側で要るものは [docs/notices.md](docs/notices.md) にあります。
 

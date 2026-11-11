@@ -37,7 +37,7 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `kind` | `http`・`connection`・`passthrough`・`dns`・`config`・`agent`・`answer`・`gate`（関所が自分で上流へ送った要求。Alertmanager への知らせと、GitHub のコネクタの問い合わせ） |
 | `treatment` | 振り分けの扱い（`open`・`passthrough`・`deny`） |
 | `name` | 宛先の名前（SNI と Host、または問い合わせた名前） |
-| `address` | 元の宛先（IP とポート） |
+| `address` | 元の宛先（IP とポート）。IPv4 は `192.0.2.10:443`、IPv6 は `[2001:db8::10]:443` の形 |
 | `method`・`path`・`query` | 要求の method・path・query |
 | `verdict` | `allow`・`ask`・`deny` |
 | `reason` | そう決めた理由。本人の答えでは、許した選択肢とその文、または断ったこと・取り消したこと |
@@ -50,7 +50,7 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `responseBytes` | 作業環境へ流した応答の本文の大きさ |
 | `bytesUp`・`bytesDown` | passthrough で送った量・受けた量 |
 | `durationNs` | 上流へ渡してから流し終えるまで、または接続の時間（ナノ秒） |
-| `dnsType`・`dnsRcode`・`dnsAnswer` | 問い合わせの型、答えの rcode、答えた IP の並び |
+| `dnsType`・`dnsRcode`・`dnsAnswer` | 問い合わせの型、答えの rcode、答えた IP の並び（AAAA では IPv6 のアドレス） |
 | `error` | 失敗の理由（上流へ渡せなかった、応答が途中で切れた、など） |
 | `authdReason` | authd が上流の応答を返さなかったときの理由の名前（[関所と authd の間の形](authd-protocol.md)）。断りか失敗かは `error` の文に出る |
 | `finished` | 書き終えたか |
