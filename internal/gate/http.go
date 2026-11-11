@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
+	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
@@ -102,8 +103,8 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	out := outgoing(r, oc, body)
 	resp, err := g.cfg.Upstream.RoundTrip(out)
 	if err != nil {
-		rec.Error = err.Error()
-		writeGate(w, http.StatusBadGateway, MarkError, "the request could not be sent upstream: "+err.Error())
+		text := upstreamFailure(rec, err)
+		writeGate(w, http.StatusBadGateway, MarkError, text)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -121,6 +122,26 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		rec.Error = "the response was cut off: " + err.Error()
 	}
+}
+
+// upstreamFailure puts why the request did not get an upstream's answer
+// into the record, and gives the text to answer the workspace with. authd's
+// own answers carry a reason and say whether authd refused or failed to
+// reach the upstream (docs/authd-protocol.md). Anything else means authd
+// itself could not be reached: the request was not sent (docs/adr/0001).
+func upstreamFailure(rec *audit.Record, err error) string {
+	var ae *authdclient.Error
+	if !errors.As(err, &ae) {
+		rec.Error = "authd could not be reached: " + err.Error()
+		return "the request was not sent: authd could not be reached"
+	}
+	rec.AuthdReason = string(ae.Reason)
+	what := "authd could not get an answer from the upstream"
+	if ae.Refused() {
+		what = "authd refused the request"
+	}
+	rec.Error = fmt.Sprintf("%s: %s: %s", what, ae.Reason, ae.Message)
+	return fmt.Sprintf("%s (%s): %s", what, ae.Reason, ae.Message)
 }
 
 // refuse records a request the gate answers itself and answers it.

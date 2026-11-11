@@ -30,7 +30,7 @@
 | 要求の本文を読めなかった | 400 | `error` |
 
 - 振り分けで断ったときの本文には、それが振り分けで決まっていて、変えるには本人が振り分けを直すことを書く（ADR-0004 の Decision「決めていないものは本人に聞く」の「deny も表のデータである」）。
-- 上流へ渡せなかったときの本文には、渡す先（authd の側）が返した理由を書く。
+- 上流へ渡せなかったときの本文には、authd が返した理由の名前と文を書く（[関所と authd の間の形](authd-protocol.md) の「断りと失敗の形」）。authd が自分の確かめで断ったときは「authd refused the request」、確かめを通ったが上流から答えが得られなかったときは「authd could not get an answer from the upstream」で始まる。authd につながらなかったときは「authd could not be reached」とだけ書く。
 
 ## HTTP の応答を返せない場面
 

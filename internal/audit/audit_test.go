@@ -3,7 +3,9 @@ package audit_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -202,5 +204,109 @@ func TestAStdoutThatFailsDoesNotLoseTheRecord(t *testing.T) {
 	}
 	if _, err := l.Get(context.Background(), rec.ID); err != nil {
 		t.Errorf("Get: %v", err)
+	}
+}
+
+func TestTheFieldsOfDecisionsAndAuthdAreKeptAndReadBack(t *testing.T) {
+	l, out, _ := openLog(t)
+	ctx := context.Background()
+	rec := &audit.Record{
+		Time:        at,
+		Kind:        audit.KindHTTP,
+		Verdict:     audit.Ask,
+		Operation:   "pulls.merge",
+		Target:      "owner=o repo=r",
+		Approval:    "ap-1",
+		Grant:       "gr-1",
+		AuthdReason: "surrogate-mismatch",
+	}
+	if err := l.Write(ctx, rec); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := l.Get(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Verdict != audit.Ask || got.Operation != rec.Operation || got.Target != rec.Target ||
+		got.Approval != rec.Approval || got.Grant != rec.Grant || got.AuthdReason != rec.AuthdReason {
+		t.Errorf("Get = %+v", got)
+	}
+	for _, field := range []string{`"operation":"pulls.merge"`, `"target":"owner=o repo=r"`, `"approval":"ap-1"`, `"grant":"gr-1"`, `"authdReason":"surrogate-mismatch"`} {
+		if !strings.Contains(out.String(), field) {
+			t.Errorf("stdout = %s, want %s", out.String(), field)
+		}
+	}
+}
+
+func TestALogOfTheFirstVersionIsMovedToTheCurrentOneWithItsRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{audit.SchemaV1ForTest, "PRAGMA user_version = 1",
+		`INSERT INTO records (time, source, kind, treatment, name, address, method, path, query, verdict, reason,
+			status, response_bytes, bytes_up, bytes_down, duration_ns, dns_type, dns_rcode, dns_answer, error, finished)
+			VALUES ('2026-11-11T00:00:00.000000000Z', 'workspace', 'dns', '', 'old.example.com', '', '', '', '', 'deny', 'r',
+			0, 0, 0, 0, 0, 'A', 'NXDOMAIN', '[]', '', 1)`} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	_ = db.Close()
+
+	l, err := audit.Open(path, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	got, err := l.Get(context.Background(), 1)
+	if err != nil || got.Name != "old.example.com" || got.Operation != "" {
+		t.Fatalf("Get = %+v, %v", got, err)
+	}
+	rec := &audit.Record{Time: at, Kind: audit.KindHTTP, Operation: "op"}
+	if err := l.Write(context.Background(), rec); err != nil {
+		t.Fatalf("Write after the move: %v", err)
+	}
+}
+
+func TestRecordsAreListedNewestFirstAndCanBeNarrowedAndPaged(t *testing.T) {
+	l, _, _ := openLog(t)
+	ctx := context.Background()
+	for i, r := range []audit.Record{
+		{Source: "workspace", Kind: audit.KindHTTP, Verdict: audit.Allow, Name: "a"},
+		{Source: "workspace", Kind: audit.KindHTTP, Verdict: audit.Deny, Name: "b"},
+		{Source: "other", Kind: audit.KindHTTP, Verdict: audit.Deny, Name: "c"},
+		{Source: "workspace", Kind: audit.KindDNS, Verdict: audit.Deny, Name: "d"},
+		{Source: "workspace", Kind: audit.KindHTTP, Verdict: audit.Ask, Name: "e"},
+	} {
+		r.Time = at.Add(time.Duration(i) * time.Second)
+		if err := l.Write(ctx, &r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func(q audit.Query) string {
+		t.Helper()
+		recs, err := l.List(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var s []string
+		for _, r := range recs {
+			s = append(s, r.Name)
+		}
+		return strings.Join(s, ",")
+	}
+	for q, want := range map[*audit.Query]string{
+		{}:                     "e,d,c,b,a",
+		{Limit: 2}:             "e,d",
+		{Before: 4, Limit: 2}:  "c,b",
+		{Kind: audit.KindHTTP}: "e,c,b,a",
+		{Source: "workspace", Kind: audit.KindHTTP, Verdicts: []audit.Verdict{audit.Deny, audit.Ask}}: "e,b",
+		{Since: at.Add(3 * time.Second)}: "e,d",
+	} {
+		if got := names(*q); got != want {
+			t.Errorf("List(%+v) = %s, want %s", *q, got, want)
+		}
 	}
 }

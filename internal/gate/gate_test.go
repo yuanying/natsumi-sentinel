@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
+	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/certs"
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
@@ -414,22 +415,59 @@ func TestARequestThatCannotBeRecordedDoesNotGoOut(t *testing.T) {
 	}
 }
 
-func TestAnUpstreamThatFailsIsAnsweredByTheGateAndRecorded(t *testing.T) {
+func TestARefusalFromAuthdIsAnsweredByTheGateAndRecordedWithItsReason(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err      *authdclient.Error
+		inRecord string
+	}{
+		"refused": {&authdclient.Error{Reason: authdclient.ReasonSurrogateMismatch, Message: "the surrogate is not registered for this upstream"}, "authd refused the request"},
+		"failed":  {&authdclient.Error{Reason: authdclient.ReasonUpstreamUnreachable, Message: "the upstream could not be reached"}, "authd could not get an answer from the upstream"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, 1)
+			e.up.mu.Lock()
+			e.up.err = tc.err
+			e.up.mu.Unlock()
+			resp, err := e.client().Get("https://api.example.com/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusBadGateway || resp.Header.Get(gate.MarkHeader) != gate.MarkError {
+				t.Errorf("response = %d with mark %q, want the gate's 502", resp.StatusCode, resp.Header.Get(gate.MarkHeader))
+			}
+			if !strings.Contains(string(body), string(tc.err.Reason)) || !strings.Contains(string(body), tc.err.Message) {
+				t.Errorf("body = %q, want authd's reason and message", body)
+			}
+			rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+			if rec.AuthdReason != string(tc.err.Reason) || !strings.Contains(rec.Error, tc.inRecord) || !strings.Contains(rec.Error, tc.err.Message) {
+				t.Errorf("record = authdReason %q, error %q", rec.AuthdReason, rec.Error)
+			}
+		})
+	}
+}
+
+func TestAnAuthdThatCannotBeReachedIsAnsweredByTheGateAndRecorded(t *testing.T) {
 	e := newEnv(t, 1)
 	e.up.mu.Lock()
-	e.up.err = errors.New("authd refused: surrogate not for this host")
+	e.up.err = errors.New("dial unix /run/authd.sock: connect: no such file or directory")
 	e.up.mu.Unlock()
 	resp, err := e.client().Get("https://api.example.com/")
 	if err != nil {
 		t.Fatal(err)
 	}
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway || resp.Header.Get(gate.MarkHeader) == "" {
+	if resp.StatusCode != http.StatusBadGateway || resp.Header.Get(gate.MarkHeader) != gate.MarkError {
 		t.Errorf("response = %d with mark %q, want the gate's 502", resp.StatusCode, resp.Header.Get(gate.MarkHeader))
 	}
+	if !strings.Contains(string(body), "authd could not be reached") {
+		t.Errorf("body = %q", body)
+	}
 	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
-	if !strings.Contains(rec.Error, "authd refused") {
-		t.Errorf("record's error = %q", rec.Error)
+	if rec.AuthdReason != "" || !strings.Contains(rec.Error, "authd could not be reached") || !strings.Contains(rec.Error, "no such file") {
+		t.Errorf("record = authdReason %q, error %q", rec.AuthdReason, rec.Error)
 	}
 }
 

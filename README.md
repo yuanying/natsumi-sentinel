@@ -23,7 +23,7 @@ natsumi-sentinel は、[natsumi](https://github.com/yuanying/natsumi) のイン�
 
 どちらのバイナリも `--version` で版を出します。authd の登録の形式は [docs/authd-registration.md](docs/authd-registration.md)、関所と authd の間の形は [docs/authd-protocol.md](docs/authd-protocol.md) にあります。
 
-関所は `-check -config <ディレクトリ>` で振り分けを確かめられます。authd へ送る口がまだ組み込まれていないので、ほかの設定がそろっていても、そう告げて起動しません。振り分けの形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md) にあります。
+関所は `-check -config <ディレクトリ>` で振り分けを確かめられます。開く宛先の要求は `-authd-socket` の authd へ渡します。authd へは最初の要求のときにつなぎ、つながらないあいだは、その要求を通しません。振り分けの形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md) にあります。
 
 image は 1 つの `Dockerfile` から、target を選んで作ります。
 

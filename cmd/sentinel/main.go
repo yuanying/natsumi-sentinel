@@ -3,9 +3,9 @@
 // what goes out (docs/adr/0001, 0002, 0006).
 //
 // Requests on open destinations are sent upstream by authd, through its
-// socket (docs/adr/0003). The sender that talks to authd is not built into
-// this version yet, so the gate refuses to start once it has checked the
-// rest of its setup: without a sender it could only fail every request.
+// socket (docs/adr/0003). The gate connects to it on first use: while authd
+// cannot be reached, every request on an open destination is refused
+// (docs/adr/0001).
 //
 // stdout carries the copy of the audit records, one JSON object per line.
 // What the gate itself has to say goes to stderr.
@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
+	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/buildinfo"
 	"github.com/yuanying/natsumi-sentinel/internal/certs"
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
@@ -43,11 +44,9 @@ const program = "sentinel"
 // version is set by the build (-X main.version).
 var version = "dev"
 
-var errNoUpstream = errors.New("no sender to authd is built into this version, so requests on open destinations could not be sent; the gate does not start without one")
-
 // newUpstream gives the http.RoundTripper that sends requests on open
-// destinations through authd. Tests replace it.
-var newUpstream = func() (http.RoundTripper, error) { return nil, errNoUpstream }
+// destinations through authd's socket. Tests replace it.
+var newUpstream = func(socket string) http.RoundTripper { return authdclient.NewTransport(socket) }
 
 // onListen is told each address the gate listens on. Tests replace it.
 var onListen = func(source, what string, addr net.Addr) {}
@@ -101,6 +100,7 @@ func (s *sourceFlag) Set(v string) error {
 
 type options struct {
 	config, caCert, caKey, db string
+	authdSocket               string
 	sources                   sourceFlag
 	gateName, gateAddress     string
 	reload                    time.Duration
@@ -116,6 +116,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.caCert, "ca-cert", "", "the gate's CA certificate, PEM")
 	fs.StringVar(&o.caKey, "ca-key", "", "the gate's CA private key, PEM")
 	fs.StringVar(&o.db, "db", "", "the SQLite file of the audit log; its directory must exist")
+	fs.StringVar(&o.authdSocket, "authd-socket", "", "authd's Unix socket, where requests on open destinations are handed on")
 	fs.Var(&o.sources, "source", "a listener pair, name=NAME,proxy=ADDR,dns=ADDR; repeat for each place redirected from")
 	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
@@ -164,6 +165,8 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 		return nil, errors.New("-ca-cert and -ca-key are required")
 	case o.db == "":
 		return nil, errors.New("-db is required")
+	case o.authdSocket == "":
+		return nil, errors.New("-authd-socket is required")
 	case len(o.sources) == 0:
 		return nil, errors.New("at least one -source is required")
 	case o.reload <= 0:
@@ -198,10 +201,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		return err
 	}
 	defer func() { _ = log.Close() }()
-	upstream, err := newUpstream()
-	if err != nil {
-		return err
-	}
+	upstream := newUpstream(o.authdSocket)
 
 	var (
 		closers []func() error

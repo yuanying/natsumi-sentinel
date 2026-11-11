@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 
+	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/testca"
 )
 
@@ -47,7 +48,7 @@ destinations:
 `
 
 type setup struct {
-	config, db string
+	config, db, authd string
 	ca         *testca.CA
 }
 
@@ -57,7 +58,7 @@ func newSetup(t *testing.T) setup {
 	if err := os.WriteFile(filepath.Join(config, "routes.yaml"), []byte(routesYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return setup{config: config, db: filepath.Join(t.TempDir(), "audit.db"), ca: testca.New(t)}
+	return setup{config: config, db: filepath.Join(t.TempDir(), "audit.db"), authd: filepath.Join(t.TempDir(), "authd.sock"), ca: testca.New(t)}
 }
 
 func (s setup) args(extra ...string) []string {
@@ -66,6 +67,7 @@ func (s setup) args(extra ...string) []string {
 		"-ca-cert", s.ca.CertFile,
 		"-ca-key", s.ca.KeyFile,
 		"-db", s.db,
+		"-authd-socket", s.authd,
 		"-source", "name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0",
 	}, extra...)
 }
@@ -100,14 +102,40 @@ func TestCheckSaysWhetherTheRoutingTableCanBeUsed(t *testing.T) {
 	}
 }
 
-func TestWithoutAnUpstreamSenderBuiltInItRefusesToStart(t *testing.T) {
+func TestWithoutAnAuthdSocketItIsAUsageError(t *testing.T) {
 	s := newSetup(t)
+	args := []string{"-config", s.config, "-ca-cert", s.ca.CertFile, "-ca-key", s.ca.KeyFile, "-db", s.db,
+		"-source", "name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0"}
 	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), s.args(), &stdout, &stderr); code != 1 {
-		t.Fatalf("run = %d, want 1", code)
+	if code := run(context.Background(), args, &stdout, &stderr); code != 2 {
+		t.Fatalf("run = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "authd") {
-		t.Errorf("stderr = %q, want it to say no sender to authd is built in", stderr.String())
+	if !strings.Contains(stderr.String(), "-authd-socket") {
+		t.Errorf("stderr = %q, want it to name -authd-socket", stderr.String())
+	}
+}
+
+func TestTheUpstreamIsAuthdAtItsSocket(t *testing.T) {
+	var got string
+	old := newUpstream
+	newUpstream = func(socket string) http.RoundTripper {
+		got = socket
+		return old(socket)
+	}
+	t.Cleanup(func() { newUpstream = old })
+	if _, ok := old("/run/authd.sock").(*authdclient.Transport); !ok {
+		t.Error("the upstream is not authdclient's Transport")
+	}
+
+	s := newSetup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	if code := run(ctx, s.args(), &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if got != s.authd {
+		t.Errorf("the upstream was made for %q, want %q", got, s.authd)
 	}
 }
 
@@ -148,7 +176,7 @@ func TestASourceMustBeNamedAndListenForBoth(t *testing.T) {
 	} {
 		t.Run(src, func(t *testing.T) {
 			s := newSetup(t)
-			args := []string{"-config", s.config, "-ca-cert", s.ca.CertFile, "-ca-key", s.ca.KeyFile, "-db", s.db, "-source", src}
+			args := []string{"-config", s.config, "-ca-cert", s.ca.CertFile, "-ca-key", s.ca.KeyFile, "-db", s.db, "-authd-socket", s.authd, "-source", src}
 			var stdout, stderr bytes.Buffer
 			if code := run(context.Background(), args, &stdout, &stderr); code != 2 {
 				t.Fatalf("run = %d, want 2", code)
@@ -161,7 +189,7 @@ func TestASourceMustBeNamedAndListenForBoth(t *testing.T) {
 func withUpstream(t *testing.T) {
 	t.Helper()
 	old := newUpstream
-	newUpstream = func() (http.RoundTripper, error) { return http.DefaultTransport, nil }
+	newUpstream = func(string) http.RoundTripper { return http.DefaultTransport }
 	t.Cleanup(func() { newUpstream = old })
 }
 
