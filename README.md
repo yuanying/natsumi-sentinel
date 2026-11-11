@@ -23,7 +23,9 @@ natsumi-sentinel は、[natsumi](https://github.com/yuanying/natsumi) のイン�
 
 どちらのバイナリも `--version` で版を出します。authd の登録の形式は [docs/authd-registration.md](docs/authd-registration.md)、関所と authd の間の形は [docs/authd-protocol.md](docs/authd-protocol.md) にあります。
 
-関所は `-check -config <ディレクトリ>` で振り分けを確かめられます。開く宛先の要求は `-authd-socket` の authd へ渡します。authd へは最初の要求のときにつなぎ、つながらないあいだは、その要求を通しません。振り分けの形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md) にあります。
+関所は `-check -config <ディレクトリ>` で振り分けと表を確かめられます。開く宛先の要求は、表で allow・ask・deny を決め、通すものを `-authd-socket` の authd へ渡します。authd へは最初の要求のときにつなぎ、つながらないあいだは、その要求を通しません。ask の要求は `-ledger` の台帳に承認待ちとして残り、本人の答えは `-approvals-socket`（`-approvals-peer-uid` の UID だけが使える）で受けます。
+
+振り分けと表の形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md)、承認を受け付ける口と作業環境向けの口は [docs/approvals-api.md](docs/approvals-api.md) にあります。
 
 image は 1 つの `Dockerfile` から、target を選んで作ります。
 
