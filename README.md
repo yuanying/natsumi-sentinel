@@ -20,7 +20,7 @@ natsumi-sentinel は、[natsumi](https://github.com/yuanying/natsumi) のイン�
 | `make fmt-check vet lint tidy vuln` | CI と同じ検査をする |
 | `make dist` | 2 つのバイナリを linux/amd64・linux/arm64 の archive にして `dist/` に置く |
 
-どちらのバイナリも `--version` で版を出します。まだ中身は実装されておらず、ほかの起動のしかたではそう告げてエラーで終わります。
+どちらのバイナリも `--version` で版を出します。authd の登録の形式は [docs/authd-registration.md](docs/authd-registration.md)、関所と authd の間の形は [docs/authd-protocol.md](docs/authd-protocol.md) にあります。関所はまだ実装されておらず、`--version` のほかの起動のしかたではそう告げてエラーで終わります。
 
 image は 1 つの `Dockerfile` から、target を選んで作ります。
 
