@@ -232,3 +232,24 @@ func TestUpstreamFailuresAreCountedByDestinationAndReason(t *testing.T) {
 		`sentinel_upstream_failures_total{destination="api.example.com",reason="authd-unreachable"} 1`,
 	)
 }
+
+func TestTheApprovalsWaitingAreReadFromTheLedgerAtEachScrape(t *testing.T) {
+	reg := metrics.NewRegistry("sentinel", "dev")
+	var (
+		n   = 2
+		err error
+	)
+	observe.NewApprovalsPending(reg, func(context.Context) (int, error) { return n, err }, nil)
+	wantLines(t, page(t, reg), `sentinel_approvals_pending 2`)
+	n = 5
+	wantLines(t, page(t, reg), `sentinel_approvals_pending 5`)
+
+	// A ledger that cannot be read leaves the series out, and the rest of
+	// the page is still served.
+	err = errors.New("database is locked")
+	got := page(t, reg)
+	if strings.Contains(got, "sentinel_approvals_pending ") {
+		t.Errorf("the metrics carry a count the ledger did not give:\n%s", got)
+	}
+	wantLines(t, got, `sentinel_build_info{version="dev"} 1`)
+}

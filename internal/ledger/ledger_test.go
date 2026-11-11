@@ -427,3 +427,41 @@ func TestALedgerInADirectoryThatDoesNotExistDoesNotOpen(t *testing.T) {
 		t.Fatal("Open succeeded")
 	}
 }
+
+func TestOnlyTheApprovalsWaitingForAnAnswerAreCountedAsOpen(t *testing.T) {
+	l, c, _ := open(t)
+	ctx := context.Background()
+	count := func() int {
+		t.Helper()
+		n, err := l.CountOpen(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count(); n != 0 {
+		t.Errorf("open on an empty ledger = %d", n)
+	}
+	a, _, _ := l.Hold(ctx, merge("5"), settings)
+	if _, _, err := l.Hold(ctx, merge("6"), settings); err != nil {
+		t.Fatal(err)
+	}
+	// The same request again is the same approval.
+	if _, _, err := l.Hold(ctx, merge("6"), settings); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(); n != 2 {
+		t.Errorf("open = %d, want 2", n)
+	}
+	if _, err := l.Answer(ctx, a.ID, ledger.Answer{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(); n != 1 {
+		t.Errorf("open after an answer = %d, want 1", n)
+	}
+	// Past its time it waits for nothing, swept or not.
+	c.advance(settings.Pending)
+	if n := count(); n != 0 {
+		t.Errorf("open after its time = %d, want 0", n)
+	}
+}

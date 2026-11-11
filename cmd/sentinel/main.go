@@ -261,6 +261,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		fixedNames = append(fixedNames, name)
 	}
 	gm := observe.NewGateMetrics(reg, watcher.Current, fixedNames)
+	observe.NewApprovalsPending(reg, book.CountOpen, logger)
 	// Everything the gate records goes through log, so that the metrics
 	// and the notices see it. pairs is set below, before anything is
 	// recorded.
