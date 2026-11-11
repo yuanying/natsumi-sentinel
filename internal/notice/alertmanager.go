@@ -90,6 +90,7 @@ type alert struct {
 var alertNames = map[string]string{
 	TypeFirstSeen:    "SentinelFirstSeen",
 	TypeDailySummary: "SentinelDailySummary",
+	TypeAnswer:       "SentinelAnswer",
 }
 
 // Send implements Sender. Nothing is sent that could not be recorded.

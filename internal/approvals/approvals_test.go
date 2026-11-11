@@ -423,3 +423,83 @@ func TestAskingBeforehandThatCannotBeRecordedIsNotTaken(t *testing.T) {
 		t.Errorf("ask = %d, want 503", code)
 	}
 }
+
+// told keeps what the owner's door tells of the answers it took.
+type told struct {
+	answered []*ledger.Approval
+	revoked  []*ledger.Grant
+	at       []time.Time
+}
+
+func (e *env) telling() *told {
+	tl := &told{}
+	now := time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC)
+	e.owner = approvals.Owner(approvals.OwnerConfig{
+		Ledger: e.ledger, Log: e.log, Ping: 50 * time.Millisecond, Now: func() time.Time { return now },
+		Answered: func(a *ledger.Approval) { tl.answered = append(tl.answered, a) },
+		Revoked: func(g *ledger.Grant, at time.Time) {
+			tl.revoked = append(tl.revoked, g)
+			tl.at = append(tl.at, at)
+		},
+	})
+	return tl
+}
+
+func TestEachAnswerTakenIsToldOnceAndOnlyWhenItTookEffect(t *testing.T) {
+	e := newEnv(t)
+	tl := e.telling()
+	a, b := e.hold("workspace", "5"), e.hold("workspace", "6")
+
+	// Not recorded, so not taken, so not told.
+	e.log.fail = true
+	if code, _ := e.do(e.owner, "POST", "/v1/approvals/"+a.ID+"/answer", `{"answer":"allow","choice":"1h"}`); code != 503 {
+		t.Fatalf("answer = %d, want 503", code)
+	}
+	e.log.fail = false
+	// Refused, so not told.
+	if code, _ := e.do(e.owner, "POST", "/v1/approvals/"+a.ID+"/answer", `{"answer":"allow","choice":"30d"}`); code != 400 {
+		t.Fatalf("answer = %d, want 400", code)
+	}
+	if len(tl.answered) != 0 {
+		t.Fatalf("told %+v of answers not taken", tl.answered)
+	}
+
+	if code, _ := e.do(e.owner, "POST", "/v1/approvals/"+a.ID+"/answer", `{"answer":"allow","choice":"1h"}`); code != 200 {
+		t.Fatalf("answer = %d", code)
+	}
+	if code, _ := e.do(e.owner, "POST", "/v1/approvals/"+b.ID+"/answer", `{"answer":"deny"}`); code != 200 {
+		t.Fatalf("answer = %d", code)
+	}
+	// A second answer is not taken.
+	if code, _ := e.do(e.owner, "POST", "/v1/approvals/"+a.ID+"/answer", `{"answer":"deny"}`); code != 409 {
+		t.Fatalf("answer again = %d, want 409", code)
+	}
+	if len(tl.answered) != 2 || tl.answered[0].ID != a.ID || tl.answered[0].State != ledger.Allowed || tl.answered[0].Choice != "1h" ||
+		len(tl.answered[0].Grants) != 1 || tl.answered[1].ID != b.ID || tl.answered[1].State != ledger.Denied {
+		t.Errorf("told %+v", tl.answered)
+	}
+}
+
+func TestEachRevocationTakenIsToldOnceWithItsTime(t *testing.T) {
+	e := newEnv(t)
+	tl := e.telling()
+	a := e.hold("workspace", "5")
+	_, out := e.do(e.owner, "POST", "/v1/approvals/"+a.ID+"/answer", `{"answer":"allow","choice":"forever"}`)
+	id, _ := list(out["grants"])[0].(string)
+
+	e.log.fail = true
+	if code, _ := e.do(e.owner, "DELETE", "/v1/grants/"+id, ""); code != 503 {
+		t.Fatalf("revoke = %d, want 503", code)
+	}
+	e.log.fail = false
+	if code, _ := e.do(e.owner, "DELETE", "/v1/grants/"+id, ""); code != 200 {
+		t.Fatalf("revoke = %d", code)
+	}
+	if code, _ := e.do(e.owner, "DELETE", "/v1/grants/"+id, ""); code != 404 {
+		t.Fatalf("revoke again = %d, want 404", code)
+	}
+	if len(tl.revoked) != 1 || tl.revoked[0].ID != id || tl.revoked[0].Approval != a.ID || tl.revoked[0].Operation != "pulls.merge" ||
+		!tl.at[0].Equal(time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC)) {
+		t.Errorf("told %+v at %v", tl.revoked, tl.at)
+	}
+}

@@ -1,6 +1,7 @@
 // Package notice tells the owner what is out of the ordinary, without a
 // judge (docs/adr/0006, docs/notices.md): each pair the gate sees go
-// through for the first time, and once a day a summary of the day.
+// through for the first time, each answer of the owner's it takes, and
+// once a day a summary of the day.
 //
 // The notices go to Alertmanager, through authd like any other request
 // out of the gate (docs/adr/0002), and Alertmanager takes them to the
@@ -25,7 +26,13 @@ const (
 	TypeFirstSeen = "first-seen"
 	// TypeDailySummary tells what a day's records count up to.
 	TypeDailySummary = "daily-summary"
+	// TypeAnswer tells one answer of the owner's, or one revocation, the
+	// gate took.
+	TypeAnswer = "answer"
 )
+
+// Types are all the types of notice.
+var Types = []string{TypeFirstSeen, TypeAnswer, TypeDailySummary}
 
 // Notice is one thing to tell.
 type Notice struct {

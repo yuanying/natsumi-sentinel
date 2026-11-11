@@ -293,7 +293,11 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		return fmt.Errorf("the approvals socket: %w", err)
 	}
 	owner := &http.Server{
-		Handler:           approvals.Owner(approvals.OwnerConfig{Ledger: book, Log: records}),
+		Handler: approvals.Owner(approvals.OwnerConfig{
+			Ledger: book, Log: records,
+			Answered: func(a *ledger.Approval) { outbox.Put(notice.Answered(a)) },
+			Revoked:  func(g *ledger.Grant, at time.Time) { outbox.Put(notice.Revoked(g, at)) },
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}

@@ -92,7 +92,7 @@ func NewOutbox(cfg OutboxConfig) *Outbox {
 	if cfg.Registerer != nil {
 		cfg.Registerer.MustRegister(o.put, o.failures, o.dropped, o.waiting, configured)
 	}
-	for _, t := range []string{TypeFirstSeen, TypeDailySummary} {
+	for _, t := range Types {
 		o.put.WithLabelValues(t)
 	}
 	return o
