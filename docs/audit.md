@@ -6,7 +6,7 @@
 
 - 正本は `-db` で渡す SQLite のファイルである。ファイルのあるディレクトリが無ければ関所は起動しない（volume の mount 忘れを、空のディレクトリを作って隠さない）。
 - 同じ記録を、1 件ごとに 1 行の JSON で標準出力にも出す。これは写しで、書けなくても要求は止めない。関所自身のログは標準エラーに出し、標準出力には記録だけが出る。
-- 記録の表は `records` の 1 つで、SQLite の `user_version` で形の版を持つ。いまの版は 1 である。
+- 記録の表は `records` の 1 つで、SQLite の `user_version` で形の版を持つ。いまの版は 2 である。版 1 のファイルは、起動のときに版 2 へ移す（欄を足すだけで、ある記録はそのまま残る）。関所より新しい版のファイルは開かず、起動しない。
 - 同じファイルに、「初めて見る」の覚えの表 `seen` を記録と別に持つ（[知らせ](notices.md)）。組の種類（`pair`）・中身（`key`）・初めて見た記録の時刻（`first_time`）と番号（`first_record`）の 4 つの列で、組の種類と中身で 1 行である。`records` の形の版とは別に、無ければ起動のときに作る。古い記録を消すときにも消さない。
 
 ## 書く時と、書けないとき
@@ -18,6 +18,8 @@
 | 断った接続・要求（`connection`・`http`） | 断るときに 1 度 | 断ることは変わらない。標準エラーに出す |
 | 名前解決（`dns`） | 答える前に 1 度 | 答えずに SERVFAIL を返す |
 | 振り分けの読み直し（`config`） | 読み直したとき・読めなかったとき | 標準エラーに出す |
+| 作業環境が先に承認を頼んだ（`agent`） | 承認待ちを作る前に 1 度 | 承認待ちを作らず、503 を返す |
+| 本人の答え・許しの取り消し（`answer`） | 台帳に効かせる前に 1 度 | 答え・取り消しを受けず、503 を返す |
 | 関所自身の要求（`gate`） | 送る前に 1 度書き、答えを受けたら残りを書き足す | 送らない。知らせなら待ちに残し、後で送り直す |
 
 - 書き足す前に関所が止まった記録は、`finished` が偽のまま残る。途中で切れた要求や接続が、そうと分かる形で残る。
@@ -25,20 +27,24 @@
 
 ## 欄
 
-JSON の名前で書く。SQLite の列は同じ意味の snake_case である（`request` は `request_text`・`request_size`・`request_sha256`・`request_truncated`・`request_binary` の 5 つの列に分かれる）。当てはまらない欄は空にする。
+JSON の名前で書く。SQLite の列は同じ意味の snake_case である（`grant` の列は `grant_id`。`request` は `request_text`・`request_size`・`request_sha256`・`request_truncated`・`request_binary` の 5 つの列に分かれる）。当てはまらない欄は空にする。
 
 | 欄 | 中身 |
 |---|---|
 | `id` | 記録の番号 |
 | `time` | 記録を始めた時刻（UTC） |
 | `source` | どの向け直し元の待ち受けに来たか（`-source` の `name`） |
-| `kind` | `http`・`connection`・`passthrough`・`dns`・`config`・`gate`（関所が自分で上流へ送った要求。いまは Alertmanager への知らせだけ） |
+| `kind` | `http`・`connection`・`passthrough`・`dns`・`config`・`agent`・`answer`・`gate`（関所が自分で上流へ送った要求。いまは Alertmanager への知らせだけ） |
 | `treatment` | 振り分けの扱い（`open`・`passthrough`・`deny`） |
 | `name` | 宛先の名前（SNI と Host、または問い合わせた名前） |
 | `address` | 元の宛先（IP とポート） |
 | `method`・`path`・`query` | 要求の method・path・query |
-| `verdict` | `allow` か `deny` |
-| `reason` | そう決めた理由 |
+| `verdict` | `allow`・`ask`・`deny` |
+| `reason` | そう決めた理由。本人の答えでは、許した選択肢とその文、または断ったこと・取り消したこと |
+| `operation` | 要求を揃えた操作の名前。生の操作では空 |
+| `target` | 操作の対象。`名前=値` を空白で区切って、規則に書いた順に並べる |
+| `approval` | 記録が関わる承認待ちの id（ask で作った・まとめた承認待ち、本人が答えた承認待ち） |
+| `grant` | 要求が当たった許しの id、または取り消した許しの id。許した答えでは、出した許しの id を空白で区切って並べる |
 | `request` | 要求の本文（下の表） |
 | `status` | 応答の状態 |
 | `responseBytes` | 作業環境へ流した応答の本文の大きさ |
@@ -46,7 +52,11 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `durationNs` | 上流へ渡してから流し終えるまで、または接続の時間（ナノ秒） |
 | `dnsType`・`dnsRcode`・`dnsAnswer` | 問い合わせの型、答えの rcode、答えた IP の並び |
 | `error` | 失敗の理由（上流へ渡せなかった、応答が途中で切れた、など） |
+| `authdReason` | authd が上流の応答を返さなかったときの理由の名前（[関所と authd の間の形](authd-protocol.md)）。断りか失敗かは `error` の文に出る |
 | `finished` | 書き終えたか |
+
+- `answer` の記録の `verdict` は、許した答えが `allow`、断った答えと取り消しが `deny` である。`name`・`operation`・`target`・`method`・`path` は、承認待ちの最初の中身か、取り消した許しのものを入れる。
+- `agent` の記録の `verdict` は `ask` で、`approval` に作った承認待ちの id が入る。
 
 ## 要求の本文
 

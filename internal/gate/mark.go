@@ -16,10 +16,17 @@ const MarkHeader = "Natsumi-Sentinel"
 const (
 	// MarkDeny is a refusal: the request was not sent upstream.
 	MarkDeny = "deny"
+	// MarkAsk is a request held for the owner's answer: it was not sent
+	// upstream, and goes through if made again once the owner allows it.
+	MarkAsk = "ask"
 	// MarkError is the gate failing to do its part: the request was not
 	// sent, or not sent in full, because something in the gate failed.
 	MarkError = "error"
 )
+
+// ApprovalHeader carries the id of the approval an asked request is held
+// on, beside MarkAsk.
+const ApprovalHeader = "Natsumi-Sentinel-Approval"
 
 // writeGate writes one of the gate's own answers.
 func writeGate(w http.ResponseWriter, status int, mark, text string) {

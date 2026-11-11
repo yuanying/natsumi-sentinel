@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,12 @@ const (
 	KindDNS Kind = "dns"
 	// KindConfig is the gate reading its routing table again.
 	KindConfig Kind = "config"
+	// KindAgent is the workspace asking the gate for an approval
+	// beforehand, through the gate's own address.
+	KindAgent Kind = "agent"
+	// KindAnswer is the owner's answer to an approval, or the owner
+	// revoking a grant, taken on the approvals socket.
+	KindAnswer Kind = "answer"
 	// KindGate is a request the gate itself sent upstream (a notice).
 	KindGate Kind = "gate"
 )
@@ -50,7 +57,9 @@ type Verdict string
 
 const (
 	Allow Verdict = "allow"
-	Deny  Verdict = "deny"
+	// Ask is a request held for the owner's answer (docs/adr/0004).
+	Ask  Verdict = "ask"
+	Deny Verdict = "deny"
 )
 
 // Body is what is kept of a request body: the text up to the limit, and the
@@ -87,6 +96,17 @@ type Record struct {
 	Verdict Verdict `json:"verdict,omitempty"`
 	Reason  string  `json:"reason,omitempty"`
 
+	// Operation is the name of the operation the request was matched to,
+	// and Target its target, as "key=value" pairs in the order the rule
+	// gives (docs/adr/0004). Both are empty for a raw operation.
+	Operation string `json:"operation,omitempty"`
+	Target    string `json:"target,omitempty"`
+	// Approval is the approval the record is about: the one a request was
+	// held for, or the one the owner answered.
+	Approval string `json:"approval,omitempty"`
+	// Grant is the grant the request went through on, or the one revoked.
+	Grant string `json:"grant,omitempty"`
+
 	Request       *Body         `json:"request,omitempty"`
 	Status        int           `json:"status,omitempty"`
 	ResponseBytes int64         `json:"responseBytes,omitempty"`
@@ -99,6 +119,9 @@ type Record struct {
 	DNSAnswer []string `json:"dnsAnswer,omitempty"`
 
 	Error string `json:"error,omitempty"`
+	// AuthdReason is the reason authd gave for not handing back an
+	// upstream's response (docs/authd-protocol.md).
+	AuthdReason string `json:"authdReason,omitempty"`
 
 	// Finished is false between Begin and Finish: a record that stays
 	// unfinished was cut off (the gate stopped while it was in flight).
@@ -113,9 +136,11 @@ type Log struct {
 	out io.Writer
 }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
-const schema = `
+// schemaV1 is the table as its first version had it. Each later version
+// adds to it with the statements in upgrades.
+const schemaV1 = `
 CREATE TABLE records (
 	id INTEGER PRIMARY KEY,
 	time TEXT NOT NULL,
@@ -148,6 +173,16 @@ CREATE TABLE records (
 CREATE INDEX records_time ON records (time);
 `
 
+// upgrades[i] takes the table from version i+1 to i+2.
+var upgrades = []string{
+	`ALTER TABLE records ADD COLUMN operation TEXT NOT NULL DEFAULT '';
+	ALTER TABLE records ADD COLUMN target TEXT NOT NULL DEFAULT '';
+	ALTER TABLE records ADD COLUMN approval TEXT NOT NULL DEFAULT '';
+	ALTER TABLE records ADD COLUMN grant_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE records ADD COLUMN authd_reason TEXT NOT NULL DEFAULT '';
+	CREATE INDEX records_source_verdict ON records (source, verdict, id);`,
+}
+
 // Open opens the SQLite file at path, creating it if it does not exist, and
 // copies each finished record to out. The directory must exist: a missing
 // volume is a mistake to stop on, not something to create.
@@ -178,25 +213,32 @@ func migrate(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("read the audit log's version: %w", err)
 	}
-	switch v {
-	case schemaVersion:
+	if v == schemaVersion {
 		return nil
-	case 0:
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("create the audit log: %w", err)
-		}
-		defer func() { _ = tx.Rollback() }()
-		if _, err := tx.Exec(schema); err != nil {
-			return fmt.Errorf("create the audit log: %w", err)
-		}
-		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-			return fmt.Errorf("create the audit log: %w", err)
-		}
-		return tx.Commit()
-	default:
+	}
+	if v > schemaVersion {
 		return fmt.Errorf("the audit log is version %d; this build knows %d", v, schemaVersion)
 	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("move the audit log to version %d: %w", schemaVersion, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if v == 0 {
+		if _, err := tx.Exec(schemaV1); err != nil {
+			return fmt.Errorf("create the audit log: %w", err)
+		}
+		v = 1
+	}
+	for ; v < schemaVersion; v++ {
+		if _, err := tx.Exec(upgrades[v-1]); err != nil {
+			return fmt.Errorf("move the audit log to version %d: %w", v+1, err)
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		return fmt.Errorf("move the audit log to version %d: %w", schemaVersion, err)
+	}
+	return tx.Commit()
 }
 
 // Close closes the SQLite file.
@@ -229,12 +271,12 @@ func (l *Log) Finish(ctx context.Context, rec *Record) error {
 		verdict = ?, reason = ?,
 		request_text = ?, request_size = ?, request_sha256 = ?, request_truncated = ?, request_binary = ?,
 		status = ?, response_bytes = ?, bytes_up = ?, bytes_down = ?, duration_ns = ?,
-		error = ?, finished = 1
+		error = ?, authd_reason = ?, grant_id = ?, finished = 1
 		WHERE id = ?`,
 		string(rec.Verdict), rec.Reason,
 		text, size, hash, trunc, bin,
 		rec.Status, rec.ResponseBytes, rec.BytesUp, rec.BytesDown, int64(rec.Duration),
-		rec.Error, rec.ID)
+		rec.Error, rec.AuthdReason, rec.Grant, rec.ID)
 	if err != nil {
 		return fmt.Errorf("finish audit record %d: %w", rec.ID, err)
 	}
@@ -252,13 +294,15 @@ func (l *Log) insert(ctx context.Context, rec *Record) error {
 		time, source, kind, treatment, name, address, method, path, query, verdict, reason,
 		request_text, request_size, request_sha256, request_truncated, request_binary,
 		status, response_bytes, bytes_up, bytes_down, duration_ns,
-		dns_type, dns_rcode, dns_answer, error, finished
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		dns_type, dns_rcode, dns_answer, error, finished,
+		operation, target, approval, grant_id, authd_reason
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		formatTime(rec.Time), rec.Source, string(rec.Kind), rec.Treatment, rec.Name, rec.Address,
 		rec.Method, rec.Path, rec.Query, string(rec.Verdict), rec.Reason,
 		text, size, hash, trunc, bin,
 		rec.Status, rec.ResponseBytes, rec.BytesUp, rec.BytesDown, int64(rec.Duration),
-		rec.DNSType, rec.DNSRcode, string(answer), rec.Error, rec.Finished)
+		rec.DNSType, rec.DNSRcode, string(answer), rec.Error, rec.Finished,
+		rec.Operation, rec.Target, rec.Approval, rec.Grant, rec.AuthdReason)
 	if err != nil {
 		return fmt.Errorf("write audit record: %w", err)
 	}
@@ -287,6 +331,25 @@ var ErrNotFound = errors.New("no such audit record")
 
 // Get reads one record back.
 func (l *Log) Get(ctx context.Context, id int64) (*Record, error) {
+	rec, err := scanRecord(l.db.QueryRowContext(ctx, `SELECT `+columns+` FROM records WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read audit record %d: %w", id, err)
+	}
+	return rec, nil
+}
+
+const columns = `id, time, source, kind, treatment, name, address, method, path, query, verdict, reason,
+	request_text, request_size, request_sha256, request_truncated, request_binary,
+	status, response_bytes, bytes_up, bytes_down, duration_ns,
+	dns_type, dns_rcode, dns_answer, error, finished,
+	operation, target, approval, grant_id, authd_reason`
+
+type scanner interface{ Scan(dest ...any) error }
+
+func scanRecord(row scanner) (*Record, error) {
 	var (
 		rec                      Record
 		t, kind, verdict, answer string
@@ -294,25 +357,18 @@ func (l *Log) Get(ctx context.Context, id int64) (*Record, error) {
 		size, trunc, bin         sql.NullInt64
 		duration                 int64
 	)
-	err := l.db.QueryRowContext(ctx, `SELECT
-		id, time, source, kind, treatment, name, address, method, path, query, verdict, reason,
-		request_text, request_size, request_sha256, request_truncated, request_binary,
-		status, response_bytes, bytes_up, bytes_down, duration_ns,
-		dns_type, dns_rcode, dns_answer, error, finished
-		FROM records WHERE id = ?`, id).Scan(
+	err := row.Scan(
 		&rec.ID, &t, &rec.Source, &kind, &rec.Treatment, &rec.Name, &rec.Address,
 		&rec.Method, &rec.Path, &rec.Query, &verdict, &rec.Reason,
 		&text, &size, &hash, &trunc, &bin,
 		&rec.Status, &rec.ResponseBytes, &rec.BytesUp, &rec.BytesDown, &duration,
-		&rec.DNSType, &rec.DNSRcode, &answer, &rec.Error, &rec.Finished)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
+		&rec.DNSType, &rec.DNSRcode, &answer, &rec.Error, &rec.Finished,
+		&rec.Operation, &rec.Target, &rec.Approval, &rec.Grant, &rec.AuthdReason)
 	if err != nil {
-		return nil, fmt.Errorf("read audit record %d: %w", id, err)
+		return nil, err
 	}
 	if rec.Time, err = time.Parse(timeFormat, t); err != nil {
-		return nil, fmt.Errorf("read audit record %d: %w", id, err)
+		return nil, err
 	}
 	rec.Kind = Kind(kind)
 	rec.Verdict = Verdict(verdict)
@@ -321,9 +377,85 @@ func (l *Log) Get(ctx context.Context, id int64) (*Record, error) {
 		rec.Request = &Body{Text: text.String, Size: size.Int64, SHA256: hash.String, Truncated: trunc.Int64 != 0, Binary: bin.Int64 != 0}
 	}
 	if err := json.Unmarshal([]byte(answer), &rec.DNSAnswer); err != nil {
-		return nil, fmt.Errorf("read audit record %d: %w", id, err)
+		return nil, err
 	}
 	return &rec, nil
+}
+
+// Query narrows the records List reads. Zero fields do not narrow.
+type Query struct {
+	Source   string
+	Kind     Kind
+	Verdicts []Verdict
+	// Since keeps the records made at or after it.
+	Since time.Time
+	// Before keeps the records with an id below it, for reading on from
+	// the last page.
+	Before int64
+	// Limit is how many records at most; 0 means 100, and more than 1000
+	// is 1000.
+	Limit int
+}
+
+// List reads the records q asks for, newest first.
+func (l *Log) List(ctx context.Context, q Query) ([]*Record, error) {
+	var (
+		where []string
+		args  []any
+	)
+	if q.Source != "" {
+		where = append(where, "source = ?")
+		args = append(args, q.Source)
+	}
+	if q.Kind != "" {
+		where = append(where, "kind = ?")
+		args = append(args, string(q.Kind))
+	}
+	if len(q.Verdicts) > 0 {
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(q.Verdicts)), ",")
+		where = append(where, "verdict IN ("+marks+")")
+		for _, v := range q.Verdicts {
+			args = append(args, string(v))
+		}
+	}
+	if !q.Since.IsZero() {
+		where = append(where, "time >= ?")
+		args = append(args, formatTime(q.Since))
+	}
+	if q.Before > 0 {
+		where = append(where, "id < ?")
+		args = append(args, q.Before)
+	}
+	limit := q.Limit
+	switch {
+	case limit <= 0:
+		limit = 100
+	case limit > 1000:
+		limit = 1000
+	}
+	stmt := `SELECT ` + columns + ` FROM records`
+	if len(where) > 0 {
+		stmt += " WHERE " + strings.Join(where, " AND ")
+	}
+	stmt += " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := l.db.QueryContext(ctx, stmt, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list audit records: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*Record
+	for rows.Next() {
+		rec, err := scanRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list audit records: %w", err)
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list audit records: %w", err)
+	}
+	return out, nil
 }
 
 // Prune deletes the records made before cutoff and reports how many it

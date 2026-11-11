@@ -185,10 +185,11 @@ func TestAStartThatFailsAfterTheMetricsAreServedStillEnds(t *testing.T) {
 	}
 	defer func() { _ = busy.Close() }()
 	s := newSetup(t)
-	args := []string{
-		"-config", s.config, "-ca-cert", s.ca.CertFile, "-ca-key", s.ca.KeyFile, "-db", s.db,
-		"-source", "name=workspace,proxy=" + busy.Addr().String() + ",dns=127.0.0.1:0",
-		"-metrics-listen", "127.0.0.1:0",
+	args := s.args("-metrics-listen", "127.0.0.1:0")
+	for i, a := range args {
+		if a == "-source" {
+			args[i+1] = "name=workspace,proxy=" + busy.Addr().String() + ",dns=127.0.0.1:0"
+		}
 	}
 	done := make(chan int, 1)
 	go func() {

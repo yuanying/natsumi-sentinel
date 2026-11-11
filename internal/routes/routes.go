@@ -35,11 +35,13 @@ const (
 	Closed Treatment = "deny"
 )
 
-// Action is what happens to a request that no rule decides on.
+// Action is what the table says to do with a request: let it through, ask
+// the owner, or refuse it (docs/adr/0004).
 type Action string
 
 const (
 	Allow Action = "allow"
+	Ask   Action = "ask"
 	Deny  Action = "deny"
 )
 
@@ -51,6 +53,10 @@ type Destination struct {
 	// the destination is open.
 	Default Action
 	Ports   []uint16
+	// Rules match requests to operations, first match first.
+	Rules []Rule
+	// Operations give the action for an operation by its name.
+	Operations map[string]Action
 }
 
 // AllowsPort reports whether the destination is reached on port.
@@ -82,6 +88,7 @@ type Table struct {
 	destinations map[string]Destination
 	passthrough  []passthrough
 	audit        AuditSettings
+	approvals    ApprovalSettings
 }
 
 // Lookup returns the destination named name, if the table lists it on
@@ -115,6 +122,9 @@ func (t *Table) Passthrough(addr netip.AddrPort) bool {
 // Audit returns the audit settings.
 func (t *Table) Audit() AuditSettings { return t.audit }
 
+// Approvals returns the approval settings.
+func (t *Table) Approvals() ApprovalSettings { return t.approvals }
+
 // Normalize gives the form names are compared in: lower case, without a
 // trailing dot.
 func Normalize(name string) string {
@@ -124,10 +134,12 @@ func Normalize(name string) string {
 // The shape of one file.
 type file struct {
 	Destinations []struct {
-		Name      string `yaml:"name"`
-		Treatment string `yaml:"treatment"`
-		Default   string `yaml:"default"`
-		Ports     []int  `yaml:"ports"`
+		Name       string            `yaml:"name"`
+		Treatment  string            `yaml:"treatment"`
+		Default    string            `yaml:"default"`
+		Ports      []int             `yaml:"ports"`
+		Rules      []rawRule         `yaml:"rules"`
+		Operations map[string]string `yaml:"operations"`
 	} `yaml:"destinations"`
 	Passthrough []struct {
 		CIDR  string `yaml:"cidr"`
@@ -137,6 +149,7 @@ type file struct {
 		RetentionDays  *int   `yaml:"retentionDays"`
 		BodyLimitBytes *int64 `yaml:"bodyLimitBytes"`
 	} `yaml:"audit"`
+	Approvals *rawApprovals `yaml:"approvals"`
 }
 
 // Load reads every *.yaml and *.yml file in dir. Entries whose names start
@@ -190,8 +203,9 @@ func parse(files []source) (*Table, error) {
 			Retention: defaultRetentionDays * 24 * time.Hour,
 			BodyLimit: defaultBodyLimit,
 		},
+		approvals: defaultApprovals(),
 	}
-	auditFrom := ""
+	auditFrom, approvalsFrom := "", ""
 	for _, src := range files {
 		var f file
 		dec := yaml.NewDecoder(bytes.NewReader(src.body))
@@ -201,6 +215,9 @@ func parse(files []source) (*Table, error) {
 		}
 		for i, d := range f.Destinations {
 			dest, err := destination(d.Name, d.Treatment, d.Default, d.Ports)
+			if err == nil {
+				err = dest.addRules(d.Rules, d.Operations)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("%s: destinations[%d]: %w", src.name, i, err)
 			}
@@ -241,6 +258,15 @@ func parse(files []source) (*Table, error) {
 				t.audit.BodyLimit = *b
 			}
 		}
+		if f.Approvals != nil {
+			if approvalsFrom != "" {
+				return nil, fmt.Errorf("%s: approvals: already given in %s", src.name, approvalsFrom)
+			}
+			approvalsFrom = src.name
+			if err := f.Approvals.apply(&t.approvals); err != nil {
+				return nil, fmt.Errorf("%s: approvals: %w", src.name, err)
+			}
+		}
 	}
 	return t, nil
 }
@@ -256,13 +282,14 @@ func destination(name, treatment, def string, ports []int) (Destination, error) 
 	d := Destination{Name: name, Treatment: Treatment(treatment)}
 	switch d.Treatment {
 	case Open:
-		switch Action(def) {
-		case Allow, Deny:
-			d.Default = Action(def)
-		case "":
-			return Destination{}, fmt.Errorf("%s: default: required for an open destination (allow or deny)", name)
+		a, ok := parseAction(def)
+		switch {
+		case ok:
+			d.Default = a
+		case def == "":
+			return Destination{}, fmt.Errorf("%s: default: required for an open destination (allow, ask or deny)", name)
 		default:
-			return Destination{}, fmt.Errorf("%s: default: %q is neither allow nor deny", name, def)
+			return Destination{}, fmt.Errorf("%s: default: %q is not allow, ask or deny", name, def)
 		}
 	case Closed:
 		if def != "" {
@@ -280,6 +307,33 @@ func destination(name, treatment, def string, ports []int) (Destination, error) 
 		return Destination{}, fmt.Errorf("%s: %w", name, err)
 	}
 	return d, nil
+}
+
+func (d *Destination) addRules(rules []rawRule, ops map[string]string) error {
+	if d.Treatment != Open && (len(rules) > 0 || len(ops) > 0) {
+		return fmt.Errorf("%s: rules and operations: only an open destination has them", d.Name)
+	}
+	for i, rr := range rules {
+		r, err := rr.check()
+		if err != nil {
+			return fmt.Errorf("%s: rules[%d]: %w", d.Name, i, err)
+		}
+		d.Rules = append(d.Rules, r)
+	}
+	if len(ops) > 0 {
+		d.Operations = map[string]Action{}
+	}
+	for name, act := range ops {
+		if !operationName.MatchString(name) {
+			return fmt.Errorf("%s: operations: %q is not an operation name", d.Name, name)
+		}
+		a, ok := parseAction(act)
+		if !ok {
+			return fmt.Errorf("%s: operations: %s: %q is not allow, ask or deny", d.Name, name, act)
+		}
+		d.Operations[name] = a
+	}
+	return nil
 }
 
 func portList(ports []int) ([]uint16, error) {

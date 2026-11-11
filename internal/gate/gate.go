@@ -55,6 +55,14 @@ type Config struct {
 	// FirstByteTimeout is how long a connection may stay silent before
 	// the gate gives up on finding out what it is. Defaults to 10s.
 	FirstByteTimeout time.Duration
+	// Agent serves the workspace's door to the gate (docs/approvals-api.md)
+	// on plain HTTP to AgentAddr, the gate's own address and port 80. Nil
+	// leaves the door shut.
+	Agent     http.Handler
+	AgentAddr netip.AddrPort
+	// StatusURL is where the workspace reads its approvals, told in the
+	// answer to an asked request. Empty leaves it out.
+	StatusURL string
 	// Logger is for what goes wrong in the gate itself, not for records.
 	Logger *slog.Logger
 	Now    func() time.Time
@@ -65,6 +73,9 @@ type Gate struct {
 	cfg  Config
 	http *http.Server
 	tlsc *connQueue
+	// agent serves the workspace's door, fed by agentc.
+	agent  *http.Server
+	agentc *connQueue
 
 	mu        sync.Mutex
 	listeners []net.Listener
@@ -101,6 +112,16 @@ func New(cfg Config) *Gate {
 		ErrorLog:  slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn),
 	}
 	go func() { _ = g.http.Serve(g.tlsc) }()
+	if cfg.Agent != nil {
+		g.agentc = newConnQueue()
+		g.agent = &http.Server{
+			Handler:           cfg.Agent,
+			ReadHeaderTimeout: 30 * time.Second,
+			IdleTimeout:       time.Minute,
+			ErrorLog:          slog.NewLogLogger(cfg.Logger.Handler(), slog.LevelWarn),
+		}
+		go func() { _ = g.agent.Serve(g.agentc) }()
+	}
 	return g
 }
 
@@ -138,6 +159,9 @@ func (g *Gate) Close() error {
 	for _, ln := range lns {
 		_ = ln.Close()
 	}
+	if g.agent != nil {
+		_ = g.agent.Close()
+	}
 	return g.http.Close()
 }
 
@@ -169,6 +193,12 @@ func (g *Gate) handle(c net.Conn) {
 		rec.Error = err.Error()
 		g.refuseConn(rec, "the connection's original destination is not known")
 		_ = c.Close()
+		return
+	}
+	if g.agent != nil && netip.AddrPortFrom(dst.Addr().Unmap(), dst.Port()) == g.cfg.AgentAddr {
+		if err := g.agentc.push(c); err != nil {
+			_ = c.Close()
+		}
 		return
 	}
 	table := g.cfg.Routes()

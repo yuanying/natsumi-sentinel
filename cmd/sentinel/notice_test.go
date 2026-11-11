@@ -23,7 +23,7 @@ func withAlertmanager(t *testing.T) *fakeAlertmanager {
 	t.Helper()
 	am := &fakeAlertmanager{posted: make(chan struct{}, 100)}
 	old := newUpstream
-	newUpstream = func() (http.RoundTripper, error) {
+	newUpstream = func(string) http.RoundTripper {
 		return tripper(func(r *http.Request) (*http.Response, error) {
 			b, _ := io.ReadAll(r.Body)
 			if r.URL.Host == "alerts.example.com" && r.URL.Path == "/api/v2/alerts" && r.Method == http.MethodPost {
@@ -33,7 +33,7 @@ func withAlertmanager(t *testing.T) *fakeAlertmanager {
 				am.posted <- struct{}{}
 			}
 			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: http.Header{}}, nil
-		}), nil
+		})
 	}
 	t.Cleanup(func() { newUpstream = old })
 	return am

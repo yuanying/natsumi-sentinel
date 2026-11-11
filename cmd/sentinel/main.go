@@ -3,9 +3,9 @@
 // what goes out (docs/adr/0001, 0002, 0006).
 //
 // Requests on open destinations are sent upstream by authd, through its
-// socket (docs/adr/0003). The sender that talks to authd is not built into
-// this version yet, so the gate refuses to start once it has checked the
-// rest of its setup: without a sender it could only fail every request.
+// socket (docs/adr/0003). The gate connects to it on first use: while authd
+// cannot be reached, every request on an open destination is refused
+// (docs/adr/0001).
 //
 // stdout carries the copy of the audit records, one JSON object per line.
 // What the gate itself has to say goes to stderr.
@@ -30,16 +30,20 @@ import (
 	// The image may have no time zones of its own for -summary-timezone.
 	_ "time/tzdata"
 
+	"github.com/yuanying/natsumi-sentinel/internal/approvals"
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
+	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/buildinfo"
 	"github.com/yuanying/natsumi-sentinel/internal/certs"
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/dnsgate"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
+	"github.com/yuanying/natsumi-sentinel/internal/ledger"
 	"github.com/yuanying/natsumi-sentinel/internal/metrics"
 	"github.com/yuanying/natsumi-sentinel/internal/notice"
 	"github.com/yuanying/natsumi-sentinel/internal/observe"
 	"github.com/yuanying/natsumi-sentinel/internal/origdst"
+	"github.com/yuanying/natsumi-sentinel/internal/peercred"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
 
@@ -48,11 +52,9 @@ const program = "sentinel"
 // version is set by the build (-X main.version).
 var version = "dev"
 
-var errNoUpstream = errors.New("no sender to authd is built into this version, so requests on open destinations could not be sent; the gate does not start without one")
-
 // newUpstream gives the http.RoundTripper that sends requests on open
-// destinations through authd. Tests replace it.
-var newUpstream = func() (http.RoundTripper, error) { return nil, errNoUpstream }
+// destinations through authd's socket. Tests replace it.
+var newUpstream = func(socket string) http.RoundTripper { return authdclient.NewTransport(socket) }
 
 // onListen is told each address the gate listens on. Tests replace it.
 var onListen = func(source, what string, addr net.Addr) {}
@@ -106,6 +108,9 @@ func (s *sourceFlag) Set(v string) error {
 
 type options struct {
 	config, caCert, caKey, db string
+	authdSocket, ledger       string
+	approvalsSocket           string
+	approvalsUID              int
 	sources                   sourceFlag
 	gateName, gateAddress     string
 	reload                    time.Duration
@@ -142,8 +147,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.caCert, "ca-cert", "", "the gate's CA certificate, PEM")
 	fs.StringVar(&o.caKey, "ca-key", "", "the gate's CA private key, PEM")
 	fs.StringVar(&o.db, "db", "", "the SQLite file of the audit log; its directory must exist")
+	fs.StringVar(&o.authdSocket, "authd-socket", "", "authd's Unix socket, where requests on open destinations are handed on")
+	fs.StringVar(&o.ledger, "ledger", "", "the SQLite file of the ledger of approvals and grants; its directory must exist")
+	fs.StringVar(&o.approvalsSocket, "approvals-socket", "", "the Unix socket the owner's door (natsumi's server) is served on")
+	fs.IntVar(&o.approvalsUID, "approvals-peer-uid", -1, "the server's UID, the only one taken on -approvals-socket")
 	fs.Var(&o.sources, "source", "a listener pair, name=NAME,proxy=ADDR,dns=ADDR; repeat for each place redirected from")
-	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution")
+	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution; the workspace's door is http://NAME/")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
@@ -196,6 +205,14 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 		return nil, errors.New("-ca-cert and -ca-key are required")
 	case o.db == "":
 		return nil, errors.New("-db is required")
+	case o.authdSocket == "":
+		return nil, errors.New("-authd-socket is required")
+	case o.ledger == "":
+		return nil, errors.New("-ledger is required")
+	case o.approvalsSocket == "":
+		return nil, errors.New("-approvals-socket is required")
+	case o.approvalsUID < 0:
+		return nil, errors.New("-approvals-peer-uid is required")
 	case len(o.sources) == 0:
 		return nil, errors.New("at least one -source is required")
 	case o.reload <= 0:
@@ -230,10 +247,13 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	upstream, err := newUpstream()
+	book, err := ledger.Open(o.ledger, nil)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = book.Close() }()
+	upstream := newUpstream(o.authdSocket)
+	decider := decide.Table{Ledger: book}
 
 	reg := metrics.NewRegistry(program, version)
 	var fixedNames []string
@@ -251,6 +271,9 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		Registerer: reg,
 	}, upstream, log, db, func() int64 { return watcher.Current().Audit().BodyLimit })
 	pairs = notice.NewWatcher(notice.WatcherConfig{Log: db, Outbox: outbox, Logger: logger, Registerer: reg})
+	// The doors write through log too, so the answers are counted and
+	// watched like every other record, and read straight from db.
+	records := approvalRecords{Log: log, db: db}
 
 	var (
 		closers []func() error
@@ -262,6 +285,27 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		}
 		wg.Wait()
 	}()
+	ol, err := peercred.Listen(o.approvalsSocket, o.approvalsUID, func(uid int) {
+		logger.Warn("refused a connection to the approvals socket from another UID", "uid", uid)
+	})
+	if err != nil {
+		return fmt.Errorf("the approvals socket: %w", err)
+	}
+	owner := &http.Server{
+		Handler:           approvals.Owner(approvals.OwnerConfig{Ledger: book, Log: records}),
+		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
+	closers = append(closers, owner.Close)
+	onListen("", "approvals", ol.Addr())
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := owner.Serve(ol); !errors.Is(err, http.ErrServerClosed) {
+			logIf(logger, err)
+		}
+	}()
+
 	if o.metrics != "" {
 		ml, err := net.Listen("tcp", o.metrics)
 		if err != nil {
@@ -280,16 +324,22 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		}()
 	}
 	for _, src := range o.sources {
-		g := gate.New(gate.Config{
+		cfg := gate.Config{
 			Source:      src.name,
 			Routes:      watcher.Current,
-			Decider:     decide.Defaults{},
+			Decider:     decider,
 			Minter:      minter,
 			Log:         log,
 			Upstream:    gm.Upstream(upstream),
 			OriginalDst: origdst.Lookup,
 			Logger:      logger.With("source", src.name),
-		})
+		}
+		for name, addr := range fixed {
+			cfg.AgentAddr = netip.AddrPortFrom(addr, 80)
+			cfg.StatusURL = "http://" + name + "/v1/status"
+			cfg.Agent = approvals.Agent(approvals.AgentConfig{Source: src.name, Ledger: book, Log: records, Routes: watcher.Current})
+		}
+		g := gate.New(cfg)
 		closers = append(closers, g.Close)
 		ln, err := net.Listen("tcp", src.proxy)
 		if err != nil {
@@ -325,7 +375,13 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		go func() { defer wg.Done(); logIf(logger, dns.ServeTCP(tl)) }()
 	}
 
-	wg.Add(5)
+	wg.Add(6)
+	go func() {
+		defer wg.Done()
+		book.RunSweeper(ctx, time.Minute, func(err error) {
+			logger.Error("the ledger could not be swept of what has ended", "error", err)
+		})
+	}()
 	go func() { defer wg.Done(); outbox.Run(ctx) }()
 	go func() { defer wg.Done(); pairs.Run(ctx) }()
 	go func() { defer wg.Done(); summary.Run(ctx) }()
@@ -400,6 +456,21 @@ func setUpNotices(o noticeOptions, cfg notice.OutboxConfig, upstream http.RoundT
 		summary, _ = notice.NewSummarizer(sc)
 	}
 	return outbox, summary
+}
+
+// approvalRecords is the audit log as the approvals doors use it: written
+// through the recorder the metrics and notices watch, read from the file.
+type approvalRecords struct {
+	observe.Log
+	db *audit.Log
+}
+
+func (r approvalRecords) List(ctx context.Context, q audit.Query) ([]*audit.Record, error) {
+	return r.db.List(ctx, q)
+}
+
+func (r approvalRecords) Get(ctx context.Context, id int64) (*audit.Record, error) {
+	return r.db.Get(ctx, id)
 }
 
 // recordReload records the routing table being read again, or failing to
