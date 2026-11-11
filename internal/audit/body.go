@@ -108,3 +108,11 @@ func trimPartialRune(b []byte) []byte {
 	}
 	return b
 }
+
+// Prefix returns the bytes read before the body was sent on: the whole body
+// when it is within the limit, its start otherwise.
+func (c *BodyCapture) Prefix() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.prefix...)
+}
