@@ -166,6 +166,9 @@ destinations:
         - operation: github.tag.create
           kinds: [create]
           ref: refs/tags/{tag...}
+        # These match only a force push the gate can tell from upstream (a
+        # rewind); one that rewrites history is read as an update, and the
+        # ruleset on GitHub's side is what keeps main (docs/github.md).
         - operation: github.push.protected
           kinds: [force]
           ref: refs/heads/main

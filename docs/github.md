@@ -1,6 +1,6 @@
 # GitHub のコネクタ
 
-関所の GitHub のコネクタが、GitHub の API と git の HTTP の要求をどう読み、どの操作に揃え、何を断るかを決める。コネクタを置くこと・部品の分け方・読みを通すこと・mutation の形を限ること・マージを head の SHA に結び付けることは ADR-0005 が決め、細部（引き直す対象の型、force push の見分け方、対応の形式）をこの文書と [振り分けの形式](routes.md) に委ねている。
+関所の GitHub のコネクタが、GitHub の API と git の HTTP の要求をどう読み、どの操作に揃え、何を断るかを決める。コネクタを置くこと・部品の分け方・読みを通すこと・mutation の形を限ること・マージを head の SHA に結び付けることは ADR-0005 が決め、細部（引き直す対象の型、上流への問い合わせの形、見分けられない push の出し方、対応の形式）をこの文書と [振り分けの形式](routes.md) に委ねている。
 
 ## どの宛先で働くか
 
@@ -127,6 +127,7 @@ ref ごとに、変え方の種類を決める。
 - `update` の命令ごとに、上流に `compare`（古い SHA...新しい SHA）を問い合わせる。答えの `status` が `ahead` か `identical` なら続き、`behind` か `diverged` なら force push である。
 - **新しい commit が push の pack の中にしか無いとき（ふつうの push と、新しい commit を作り直した force push）、上流はまだそれを知らず、404 を返す。** このときは見分けられないので、`update` とし、事実の `fastForward` を `unknown` にする。上流が新しい commit を知っているとき（前の commit への巻き戻し、すでにある commit への付け替え）だけ、force push と見分けられる。
 - pack を読めば見分けられるが、pack の中身は読まない（ADR-0005）。守っている branch の force push を確かに止めるのは、GitHub の側の ruleset である（ADR-0005 の Decision「床は GitHub の側にある」）。
+- したがって、表の `kinds: [force]` の規則（守っている branch への force push の deny など）は、force push と見分けられたときにだけ当たる。履歴を書き換えた force push は `update` として表を引く。machine account が自分で作ったリポジトリには ruleset が無いので、そこでの履歴の書き換えは関所では止まらない（ADR-0005 の Decision「git の push」）。
 
 ### 1 回の push に ref が複数あるとき
 
