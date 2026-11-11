@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
 	"github.com/yuanying/natsumi-sentinel/internal/ledger"
@@ -44,25 +45,52 @@ type Request struct {
 
 // Operation is a request matched to a name.
 type Operation struct {
+	// Name is empty for a raw operation.
 	Name string
 	// Params are what the request names: the path's parameters, and
 	// whatever a connector reads.
 	Params []routes.Param
 	// Target names the params that make the target.
 	Target []string
+	// Facts are what a connector looked up upstream about the target. They
+	// are shown on an approval and not matched.
+	Facts []routes.Param
+	// Fingerprint, when set, is what a grant of one request is matched by
+	// for this operation, in place of the request's: one operation of
+	// several in one request (a ref of a push) has its own.
+	Fingerprint string
 }
 
-// Connector reads requests to one destination that the rules cannot match
-// to operations by method and path alone (docs/adr/0005). ok is false
-// when it leaves the request to the rules. An error refuses the request.
+// Result is what a connector made of a request. A zero Result leaves the
+// request to the rules.
+type Result struct {
+	// Read is a request that only reads: it goes through without the
+	// table (docs/adr/0005).
+	Read bool
+	// Refusal, when set, refuses the request for this reason, whatever
+	// the table says: the connector could not read it as an operation of
+	// a shape it takes.
+	Refusal string
+	// Operations are what the request does. Several go out together or
+	// not at all.
+	Operations []Operation
+	// Request, when set, is what the record keeps of the body in place
+	// of the body (a push keeps its commands only).
+	Request *audit.Body
+}
+
+// Connector reads requests to the destinations it is for, which the rules
+// cannot match to operations by method, path and body alone
+// (docs/adr/0005). An error refuses the request: the connector could not
+// find out what it is (an upstream it asked did not answer).
 type Connector interface {
-	Operation(ctx context.Context, req Request) (op Operation, ok bool, err error)
+	Read(ctx context.Context, req Request) (Result, error)
 }
 
 // Ledger is the part of the ledger a decision uses.
 type Ledger interface {
-	Lookup(ctx context.Context, f ledger.Facts) (*ledger.Grant, error)
-	Hold(ctx context.Context, f ledger.Facts, s routes.ApprovalSettings) (*ledger.Approval, bool, error)
+	LookupAll(ctx context.Context, fs []ledger.Facts) ([]*ledger.Grant, error)
+	HoldAll(ctx context.Context, fs []ledger.Facts, s routes.ApprovalSettings) (*ledger.Approval, bool, error)
 }
 
 // Decision is the answer and what it was made of.
@@ -70,15 +98,22 @@ type Decision struct {
 	Verdict audit.Verdict
 	Reason  string
 	// Operation and Target are the operation's name and target; empty for
-	// a raw operation.
+	// a raw operation. A request of several operations has their names
+	// joined by ", " and their targets by "; ".
 	Operation string
 	Target    string
 	// Approval is the approval an asked request is held on, and
 	// ApprovalCreated whether this request made it.
 	Approval        string
 	ApprovalCreated bool
-	// Grant is the grant an asked request went through on.
+	// Grant is the grant an asked request went through on; the grants,
+	// joined by ",", for a request of several operations.
 	Grant string
+	// Fixed is a refusal that is not the table's (a connector's): no change
+	// to the table lets it through.
+	Fixed bool
+	// Request, when set, is what the record keeps of the body.
+	Request *audit.Body
 	// Error is set when the decision could not be made as the table says
 	// (the ledger or a connector failed): the request is refused.
 	Error string
@@ -94,92 +129,153 @@ type Table struct {
 	// Ledger holds the grants and approvals. Without one, nothing the
 	// table asks about goes through.
 	Ledger Ledger
-	// Connectors are keyed by the destination's name.
-	Connectors map[string]Connector
+	// GitHub reads the requests to destinations with a GitHub section.
+	// Without one, those requests are refused: the table says how they
+	// are named, and nothing here can read them.
+	GitHub Connector
 }
 
 // Decide implements Decider.
 func (t Table) Decide(ctx context.Context, req Request) Decision {
 	d := req.Destination
-	op, found := Operation{}, false
-	if c := t.Connectors[d.Name]; c != nil {
+	var res Result
+	if d.GitHub != nil {
+		if t.GitHub == nil {
+			return Decision{Verdict: audit.Deny, Reason: "the destination is read by the GitHub connector, and the gate has none", Error: "no GitHub connector"}
+		}
 		var err error
-		op, found, err = c.Operation(ctx, req)
+		res, err = t.GitHub.Read(ctx, req)
 		if err != nil {
 			return Decision{Verdict: audit.Deny, Reason: "the request could not be matched to an operation", Error: err.Error()}
 		}
 	}
-	if !found {
-		if m, ok := d.Match(req.Method, req.Path); ok {
-			op, found = Operation{Name: m.Operation, Params: m.Params, Target: m.Target}, true
+	switch {
+	case res.Refusal != "":
+		return Decision{Verdict: audit.Deny, Reason: "refused: " + res.Refusal, Fixed: true, Request: res.Request}
+	case res.Read:
+		return Decision{Verdict: audit.Allow, Reason: "a read: the connector lets reads through", Request: res.Request}
+	}
+	ops := res.Operations
+	if len(ops) == 0 {
+		op := Operation{}
+		if m, ok := d.MatchRequest(req.Method, req.Path, routes.ParseBody(req.Body, req.BodyComplete)); ok {
+			op = Operation{Name: m.Operation, Params: m.Params, Target: m.Target}
+		}
+		ops = []Operation{op}
+	}
+	dec := t.decide(ctx, req, ops)
+	dec.Request = res.Request
+	var names, targets []string
+	for _, op := range ops {
+		names = append(names, op.Name)
+		targets = append(targets, ledger.TargetText(op.Params, op.Target))
+	}
+	dec.Operation = joinSome(names, ", ")
+	dec.Target = joinSome(targets, "; ")
+	return dec
+}
+
+// joinSome joins the parts unless they are all empty.
+func joinSome(parts []string, sep string) string {
+	for _, p := range parts {
+		if p != "" {
+			return strings.Join(parts, sep)
 		}
 	}
-	dec := Decision{Operation: op.Name, Target: ledger.TargetText(op.Params, op.Target)}
-	what := "the operation " + op.Name
-	if !found {
+	return ""
+}
+
+// what an operation is called in a reason, and where its action comes
+// from.
+func describe(d routes.Destination, op Operation) (what, from string) {
+	what = "the operation " + op.Name
+	if op.Name == "" {
 		what = "a request no rule names"
 	}
-	action := d.ActionFor(op.Name)
-	from := "the table"
+	from = "the table"
 	if _, ok := d.Operations[op.Name]; !ok || op.Name == "" {
 		from = "the destination's default"
 	}
-	switch action {
-	case routes.Allow:
-		dec.Verdict = audit.Allow
-		dec.Reason = fmt.Sprintf("%s: %s allows it", what, from)
-		return dec
-	case routes.Ask:
-	default:
-		dec.Verdict = audit.Deny
-		dec.Reason = fmt.Sprintf("%s: %s denies it", what, from)
-		return dec
+	return what, from
+}
+
+func (t Table) decide(ctx context.Context, req Request, ops []Operation) Decision {
+	d := req.Destination
+	var (
+		asked   []Operation
+		allowed []string
+	)
+	for _, op := range ops {
+		what, from := describe(d, op)
+		switch d.ActionFor(op.Name) {
+		case routes.Allow:
+			allowed = append(allowed, fmt.Sprintf("%s: %s allows it", what, from))
+		case routes.Ask:
+			asked = append(asked, op)
+		default:
+			return Decision{Verdict: audit.Deny, Reason: fmt.Sprintf("%s: %s denies it", what, from)}
+		}
+	}
+	if len(asked) == 0 {
+		return Decision{Verdict: audit.Allow, Reason: strings.Join(allowed, "; ")}
 	}
 
+	what, from := describe(d, asked[0])
+	if len(asked) > 1 {
+		what, from = fmt.Sprintf("%d operations", len(asked)), "the table or the destination's default"
+	}
 	if t.Ledger == nil {
-		dec.Verdict = audit.Deny
-		dec.Reason = fmt.Sprintf("%s: %s asks about it, and there is no ledger", what, from)
-		dec.Error = "no ledger"
-		return dec
+		return Decision{Verdict: audit.Deny, Reason: fmt.Sprintf("%s: %s asks about it, and there is no ledger", what, from), Error: "no ledger"}
 	}
-	facts := ledger.Facts{
-		Source:      req.Source,
-		Destination: d.Name,
-		Method:      req.Method,
-		Path:        req.Path,
-		Query:       req.Query,
-		Operation:   op.Name,
-		Params:      op.Params,
-		Target:      op.Target,
-		Body:        req.BodySummary,
-		Fingerprint: fingerprint(req),
-		Exact:       req.BodyComplete,
+	facts := make([]ledger.Facts, len(asked))
+	for i, op := range asked {
+		f := ledger.Facts{
+			Source:      req.Source,
+			Destination: d.Name,
+			Method:      req.Method,
+			Path:        req.Path,
+			Query:       req.Query,
+			Operation:   op.Name,
+			Params:      op.Params,
+			Target:      op.Target,
+			Facts:       op.Facts,
+			Body:        req.BodySummary,
+			Fingerprint: fingerprint(req),
+			Exact:       req.BodyComplete,
+		}
+		if op.Fingerprint != "" {
+			f.Fingerprint, f.Exact = op.Fingerprint, true
+		}
+		facts[i] = f
 	}
-	g, err := t.Ledger.Lookup(ctx, facts)
+	grants, err := t.Ledger.LookupAll(ctx, facts)
 	if err != nil {
-		dec.Verdict = audit.Deny
-		dec.Reason = fmt.Sprintf("%s: %s asks about it, and the ledger could not be read, so there is no grant", what, from)
-		dec.Error = err.Error()
-		return dec
+		return Decision{Verdict: audit.Deny, Reason: fmt.Sprintf("%s: %s asks about it, and the ledger could not be read, so there is no grant", what, from), Error: err.Error()}
 	}
-	if g != nil {
-		dec.Verdict = audit.Allow
-		dec.Grant = g.ID
-		dec.Reason = fmt.Sprintf("%s: %s asks about it, and the grant %s covers it", what, from, g.ID)
-		return dec
+	var (
+		ids     []string
+		without []ledger.Facts
+	)
+	for i, g := range grants {
+		if g == nil {
+			without = append(without, facts[i])
+			continue
+		}
+		ids = append(ids, g.ID)
 	}
-	a, created, err := t.Ledger.Hold(ctx, facts, req.Settings)
+	if len(without) == 0 {
+		return Decision{Verdict: audit.Allow, Grant: strings.Join(ids, ","), Reason: fmt.Sprintf("%s: %s asks about it, and the grant %s covers it", what, from, strings.Join(ids, ", "))}
+	}
+	a, created, err := t.Ledger.HoldAll(ctx, without, req.Settings)
 	if err != nil {
-		dec.Verdict = audit.Deny
-		dec.Reason = fmt.Sprintf("%s: %s asks about it, and the ledger could not hold it for the owner", what, from)
-		dec.Error = err.Error()
-		return dec
+		return Decision{Verdict: audit.Deny, Reason: fmt.Sprintf("%s: %s asks about it, and the ledger could not hold it for the owner", what, from), Error: err.Error()}
 	}
-	dec.Verdict = audit.Ask
-	dec.Approval = a.ID
-	dec.ApprovalCreated = created
-	dec.Reason = fmt.Sprintf("%s: %s asks about it; held for the owner as %s", what, from, a.ID)
-	return dec
+	return Decision{
+		Verdict:         audit.Ask,
+		Approval:        a.ID,
+		ApprovalCreated: created,
+		Reason:          fmt.Sprintf("%s: %s asks about it; held for the owner as %s", what, from, a.ID),
+	}
 }
 
 // fingerprint covers what makes a request the same request again: where

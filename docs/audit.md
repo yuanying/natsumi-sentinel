@@ -34,17 +34,17 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `id` | 記録の番号 |
 | `time` | 記録を始めた時刻（UTC） |
 | `source` | どの向け直し元の待ち受けに来たか（`-source` の `name`） |
-| `kind` | `http`・`connection`・`passthrough`・`dns`・`config`・`agent`・`answer`・`gate`（関所が自分で上流へ送った要求。いまは Alertmanager への知らせだけ） |
+| `kind` | `http`・`connection`・`passthrough`・`dns`・`config`・`agent`・`answer`・`gate`（関所が自分で上流へ送った要求。Alertmanager への知らせと、GitHub のコネクタの問い合わせ） |
 | `treatment` | 振り分けの扱い（`open`・`passthrough`・`deny`） |
 | `name` | 宛先の名前（SNI と Host、または問い合わせた名前） |
 | `address` | 元の宛先（IP とポート） |
 | `method`・`path`・`query` | 要求の method・path・query |
 | `verdict` | `allow`・`ask`・`deny` |
 | `reason` | そう決めた理由。本人の答えでは、許した選択肢とその文、または断ったこと・取り消したこと |
-| `operation` | 要求を揃えた操作の名前。生の操作では空 |
-| `target` | 操作の対象。`名前=値` を空白で区切って、規則に書いた順に並べる |
+| `operation` | 要求を揃えた操作の名前。生の操作では空。1 つの要求が複数の操作になるとき（git の push の ref ごと）は、名前を `, ` でつなぐ |
+| `target` | 操作の対象。`名前=値` を空白で区切って、規則に書いた順に並べる。複数の操作では、対象を `; ` でつなぐ |
 | `approval` | 記録が関わる承認待ちの id（ask で作った・まとめた承認待ち、本人が答えた承認待ち） |
-| `grant` | 要求が当たった許しの id、または取り消した許しの id。許した答えでは、出した許しの id を空白で区切って並べる |
+| `grant` | 要求が当たった許しの id、または取り消した許しの id。複数の操作の要求では、当たった許しの id を `,` でつなぐ。許した答えでは、出した許しの id を空白で区切って並べる |
 | `request` | 要求の本文（下の表） |
 | `status` | 応答の状態 |
 | `responseBytes` | 作業環境へ流した応答の本文の大きさ |
@@ -72,7 +72,8 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 - 上限は、上流へ渡す前に読む量でもある。上限までを先に読んで記録に書き、残りは上流へ流しながら大きさとハッシュを数え、終わったときに書き足す。上限の手前で終わる本文は、渡す前の記録に大きさとハッシュまで入る。
 - 上限で文字の途中が切れたときは、切れた文字を除いて残す。
 - 要求のヘッダは残さない（鍵とサロゲートの載る場所であるため）。応答の本文も残さない。
-- 関所自身の要求は、送った本文（知らせの alert の JSON）を、同じ上限まで残す。`source` と `treatment` は空である。
+- git の push（GitHub のコネクタが読んだ `git-receive-pack`）は、`text` に命令の並び（ref ごとに「古い SHA・新しい SHA・ref」の 1 行）だけを残し、pack は残さない（ADR-0006）。`size` と `sha256` は本文全体のものである。
+- 関所自身の要求は、送った本文（知らせの alert の JSON、GitHub のコネクタの GraphQL の問い合わせ）を残す。知らせは同じ上限までである。知らせの `source` と `treatment` は空である。GitHub のコネクタの問い合わせの `source` は、問い合わせのもとになった要求の向け直し元で、`reason` は何のための問い合わせかを書く（[GitHub のコネクタ](github.md)）。
 
 ## 古い記録を消す
 
