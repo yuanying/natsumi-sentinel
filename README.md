@@ -25,6 +25,8 @@ natsumi-sentinel は、[natsumi](https://github.com/yuanying/natsumi) のイン�
 
 関所は `-check -config <ディレクトリ>` で振り分けを確かめられます。authd へ送る口がまだ組み込まれていないので、ほかの設定がそろっていても、そう告げて起動しません。振り分けの形式は [docs/routes.md](docs/routes.md)、関所が返す応答とその印は [docs/gate-responses.md](docs/gate-responses.md)、記録の欄は [docs/audit.md](docs/audit.md) にあります。
 
+関所と authd は `-metrics-listen`（authd は `--metrics-listen`）で Prometheus の指標を出します。名前と label は [docs/metrics.md](docs/metrics.md) にあります。関所は、初めて見る宛先や書きの操作と 1 日のまとめを、authd を通して Alertmanager に知らせます。形と、環境の側で要るものは [docs/notices.md](docs/notices.md) にあります。
+
 image は 1 つの `Dockerfile` から、target を選んで作ります。
 
 | image | target | プログラム |

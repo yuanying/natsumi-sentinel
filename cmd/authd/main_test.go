@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +17,21 @@ import (
 
 	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 )
+
+// waitForSocket waits for authd's socket to appear.
+func waitForSocket(t *testing.T, socket string, stderr *syncBuffer) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(socket); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the socket did not appear; stderr: %s", stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 type syncBuffer struct {
 	mu  sync.Mutex
@@ -148,5 +165,75 @@ func TestItServesOnTheSocketUntilItIsToldToStop(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not return after being told to stop")
+	}
+}
+
+func TestTheMetricsCountRefusalsByReason(t *testing.T) {
+	config, socket := setup(t)
+	addrs := make(chan net.Addr, 1)
+	old := onMetricsListen
+	onMetricsListen = func(a net.Addr) { addrs <- a }
+	t.Cleanup(func() { onMetricsListen = old })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stderr := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"--config", config, "--socket", socket, "--peer-uid", strconv.Itoa(os.Getuid()), "--metrics-listen", "127.0.0.1:0"}, &bytes.Buffer{}, stderr)
+	}()
+	var addr net.Addr
+	select {
+	case addr = <-addrs:
+	case code := <-done:
+		t.Fatalf("run = %d before listening; stderr: %s", code, stderr.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("the metrics were not listened for")
+	}
+	waitForSocket(t, socket, stderr)
+
+	tr := authdclient.NewTransport(socket)
+	defer tr.CloseIdleConnections()
+	req, _ := http.NewRequest(http.MethodGet, "https://nowhere.example.com/", nil)
+	if _, err := tr.RoundTrip(req); err == nil {
+		t.Fatal("an unregistered upstream was not refused")
+	}
+
+	resp, err := http.Get("http://" + addr.String() + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	page := string(b)
+	for _, want := range []string{
+		`authd_refusals_total{reason="upstream-not-registered"} 1`,
+		`authd_refusals_total{reason="surrogate-mismatch"} 0`,
+		`authd_upstream_failures_total{reason="upstream-unreachable"} 0`,
+		`authd_build_info{version="dev"} 1`,
+		"authd_refused_peers_total 0",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the metrics do not carry %q", want)
+		}
+	}
+	cancel()
+	<-done
+}
+
+func TestAMetricsAddressThatCannotBeListenedOnStopsTheStart(t *testing.T) {
+	config, socket := setup(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	var stderr bytes.Buffer
+	code := run(context.Background(), []string{"--config", config, "--socket", socket, "--peer-uid", strconv.Itoa(os.Getuid()), "--metrics-listen", ln.Addr().String()}, &bytes.Buffer{}, &stderr)
+	if code != 1 {
+		t.Fatalf("run = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "metrics") {
+		t.Errorf("stderr %q does not say the metrics are the trouble", stderr.String())
 	}
 }
