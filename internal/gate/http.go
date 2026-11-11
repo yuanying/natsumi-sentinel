@@ -81,6 +81,20 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		BodySummary:  summary(capture),
 	})
 	rec.Reason = decision.Reason
+	kept := func() *audit.Body { return summary(capture) }
+	if decision.Request != nil {
+		// What the decision keeps of the body stands in for its text
+		// (docs/adr/0006: a push keeps its commands only); the size and
+		// hash are still the whole body's.
+		kept = func() *audit.Body {
+			b := *decision.Request
+			if s := summary(capture); s != nil {
+				b.Size, b.SHA256 = s.Size, s.SHA256
+			}
+			return &b
+		}
+	}
+	rec.Request = kept()
 	rec.Operation = decision.Operation
 	rec.Target = decision.Target
 	rec.Approval = decision.Approval
@@ -92,6 +106,9 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case decision.Verdict == audit.Ask:
 		g.ask(w, rec, decision)
+		return
+	case decision.Verdict != audit.Allow && decision.Fixed:
+		g.refuse(w, rec, http.StatusForbidden, MarkDeny, decision.Reason)
 		return
 	case decision.Verdict != audit.Allow:
 		g.refuse(w, rec, http.StatusForbidden, MarkDeny, "denied: "+decision.Reason+". "+tableHint)
@@ -108,7 +125,7 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	start := g.cfg.Now()
 	defer func() {
 		rec.Duration = g.cfg.Now().Sub(start)
-		rec.Request = summary(capture)
+		rec.Request = kept()
 		// The request's own context may be gone by now.
 		if err := g.cfg.Log.Finish(context.Background(), rec); err != nil {
 			g.cfg.Logger.Error("a request's record could not be finished", "id", rec.ID, "error", err)

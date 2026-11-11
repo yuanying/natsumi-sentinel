@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yuanying/natsumi-sentinel/internal/audit"
 	"github.com/yuanying/natsumi-sentinel/internal/ledger"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
@@ -188,5 +189,69 @@ func TestTheOwnersAnswerIsToldToAlertmanagerAndTheApprovalsWaitingAreCounted(t *
 	}
 	if page := r.metrics(); !strings.Contains(page, "sentinel_approvals_pending 0\n") {
 		t.Errorf("the metrics still count the approval answered:\n%s", page)
+	}
+}
+
+func TestAnAnswerToAPushOfTwoRefsTellsBothOperationsAndNotWhatTheGateLookedUp(t *testing.T) {
+	am := withAlertmanager(t)
+	s := newSetup(t)
+	book, err := ledger.Open(s.ledger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sha = "1111111111111111111111111111111111111111"
+	item := func(ref string) ledger.Facts {
+		return ledger.Facts{
+			Source: "workspace", Destination: "git.example.com", Method: "POST", Path: "/o/r.git/git-receive-pack",
+			Operation:   "github.push.other",
+			Params:      []routes.Param{{Name: "owner", Value: "o"}, {Name: "repo", Value: "r"}, {Name: "ref", Value: ref}, {Name: "sha", Value: sha}},
+			Target:      []string{"owner", "repo", "ref"},
+			Facts:       []routes.Param{{Name: "kind", Value: "update"}, {Name: "fastForward", Value: "unknown"}},
+			Body:        &audit.Body{Text: "the commands of the push"},
+			Fingerprint: "fp-" + ref, Exact: true,
+		}
+	}
+	a, _, err := book.HoldAll(context.Background(), []ledger.Facts{item("refs/heads/a"), item("refs/heads/b")},
+		routes.ApprovalSettings{Durations: []time.Duration{time.Hour}, Once: 10 * time.Minute, Pending: 24 * time.Hour})
+	_ = book.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := startGate(t, s, []string{"workspace/dns-udp", "metrics"},
+		"-metrics-listen", "127.0.0.1:0",
+		"-alertmanager-url", "https://alerts.example.com")
+	if page := r.metrics(); !strings.Contains(page, "sentinel_approvals_pending 1\n") {
+		t.Errorf("the metrics do not count the approval of two items as one:\n%s", page)
+	}
+	oc := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", s.approvals)
+	}}, Timeout: 5 * time.Second}
+	resp, err := oc.Post("http://sentinel/v1/approvals/"+a.ID+"/answer", "application/json", strings.NewReader(`{"answer":"allow","choice":"once"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("answer = %d", resp.StatusCode)
+	}
+
+	alerts := am.wait(t)
+	annotations, _ := alerts[0]["annotations"].(map[string]any)
+	summary, _ := annotations["summary"].(string)
+	description, _ := annotations["description"].(string)
+	if !strings.Contains(summary, "github.push.other (owner=o repo=r ref=refs/heads/a) on git.example.com and 1 more") {
+		t.Errorf("summary = %q", summary)
+	}
+	for _, ref := range []string{"refs/heads/a", "refs/heads/b"} {
+		if !strings.Contains(description, "github.push.other (owner=o repo=r ref="+ref+") on git.example.com") {
+			t.Errorf("description does not tell %s: %q", ref, description)
+		}
+	}
+	for _, s := range []string{sha, "fastForward", "the commands of the push"} {
+		if strings.Contains(summary+description, s) {
+			t.Errorf("the notice tells %q:\n%s\n%s", s, summary, description)
+		}
 	}
 }

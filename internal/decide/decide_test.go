@@ -63,15 +63,24 @@ type fakeLedger struct {
 	looked  []ledger.Facts
 	held    []ledger.Facts
 	created bool
+	// grantFor, when set, gives the grant for one request.
+	grantFor func(ledger.Facts) *ledger.Grant
 }
 
-func (f *fakeLedger) Lookup(_ context.Context, facts ledger.Facts) (*ledger.Grant, error) {
-	f.looked = append(f.looked, facts)
-	return f.grant, f.err
+func (f *fakeLedger) LookupAll(_ context.Context, facts []ledger.Facts) ([]*ledger.Grant, error) {
+	f.looked = append(f.looked, facts...)
+	out := make([]*ledger.Grant, len(facts))
+	for i, fc := range facts {
+		out[i] = f.grant
+		if f.grantFor != nil {
+			out[i] = f.grantFor(fc)
+		}
+	}
+	return out, f.err
 }
 
-func (f *fakeLedger) Hold(_ context.Context, facts ledger.Facts, _ routes.ApprovalSettings) (*ledger.Approval, bool, error) {
-	f.held = append(f.held, facts)
+func (f *fakeLedger) HoldAll(_ context.Context, facts []ledger.Facts, _ routes.ApprovalSettings) (*ledger.Approval, bool, error) {
+	f.held = append(f.held, facts...)
 	if f.err != nil {
 		return nil, false, f.err
 	}
@@ -189,32 +198,32 @@ func TestALedgerThatCannotBeUsedLetsNothingAskedThrough(t *testing.T) {
 	}
 }
 
-type connector func(decide.Request) (decide.Operation, bool, error)
+type connector func(decide.Request) (decide.Result, error)
 
-func (c connector) Operation(_ context.Context, r decide.Request) (decide.Operation, bool, error) {
+func (c connector) Read(_ context.Context, r decide.Request) (decide.Result, error) {
 	return c(r)
 }
 
 func TestAConnectorNamesTheOperationBeforeTheRules(t *testing.T) {
-	c := connector(func(r decide.Request) (decide.Operation, bool, error) {
+	c := connector(func(r decide.Request) (decide.Result, error) {
 		if r.Path != "/graphql" {
-			return decide.Operation{}, false, nil
+			return decide.Result{}, nil
 		}
-		return decide.Operation{Name: "repos.delete", Params: []routes.Param{{Name: "owner", Value: "o"}}, Target: []string{"owner"}}, true, nil
+		return decide.Result{Operations: []decide.Operation{{Name: "repos.delete", Params: []routes.Param{{Name: "owner", Value: "o"}}, Target: []string{"owner"}}}}, nil
 	})
-	tbl := decide.Table{Connectors: map[string]decide.Connector{"api.example.com": c}}
-	got := tbl.Decide(context.Background(), request(t, "api.example.com", "POST", "/graphql", `{}`))
+	tbl := decide.Table{GitHub: c}
+	got := tbl.Decide(context.Background(), ghRequest(t, "api.example.com", "POST", "/graphql", `{}`))
 	if got.Verdict != audit.Deny || got.Operation != "repos.delete" || got.Target != "owner=o" {
 		t.Errorf("Decide = %+v", got)
 	}
-	got = tbl.Decide(context.Background(), request(t, "api.example.com", "GET", "/x", ``))
+	got = tbl.Decide(context.Background(), ghRequest(t, "api.example.com", "GET", "/x", ``))
 	if got.Operation != "read" {
 		t.Errorf("the rules did not decide what the connector left: %+v", got)
 	}
-	failing := decide.Table{Connectors: map[string]decide.Connector{"api.example.com": connector(func(decide.Request) (decide.Operation, bool, error) {
-		return decide.Operation{}, false, errors.New("could not look the node up")
-	})}}
-	if got := failing.Decide(context.Background(), request(t, "api.example.com", "GET", "/x", ``)); got.Verdict != audit.Deny || got.Error == "" {
+	failing := decide.Table{GitHub: connector(func(decide.Request) (decide.Result, error) {
+		return decide.Result{}, errors.New("could not look the node up")
+	})}
+	if got := failing.Decide(context.Background(), ghRequest(t, "api.example.com", "GET", "/x", ``)); got.Verdict != audit.Deny || got.Error == "" {
 		t.Errorf("a failing connector: %+v", got)
 	}
 }

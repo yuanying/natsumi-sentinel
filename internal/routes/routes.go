@@ -57,6 +57,9 @@ type Destination struct {
 	Rules []Rule
 	// Operations give the action for an operation by its name.
 	Operations map[string]Action
+	// GitHub, when set, has the destination's requests read by the GitHub
+	// connector.
+	GitHub *GitHub
 }
 
 // AllowsPort reports whether the destination is reached on port.
@@ -140,6 +143,7 @@ type file struct {
 		Ports      []int             `yaml:"ports"`
 		Rules      []rawRule         `yaml:"rules"`
 		Operations map[string]string `yaml:"operations"`
+		GitHub     *rawGitHub        `yaml:"github"`
 	} `yaml:"destinations"`
 	Passthrough []struct {
 		CIDR  string `yaml:"cidr"`
@@ -217,6 +221,13 @@ func parse(files []source) (*Table, error) {
 			dest, err := destination(d.Name, d.Treatment, d.Default, d.Ports)
 			if err == nil {
 				err = dest.addRules(d.Rules, d.Operations)
+			}
+			if err == nil && d.GitHub != nil {
+				if dest.Treatment != Open {
+					err = fmt.Errorf("%s: github: only an open destination has one", dest.Name)
+				} else if dest.GitHub, err = d.GitHub.check(dest.Name); err != nil {
+					err = fmt.Errorf("%s: github: %w", dest.Name, err)
+				}
 			}
 			if err != nil {
 				return nil, fmt.Errorf("%s: destinations[%d]: %w", src.name, i, err)

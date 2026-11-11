@@ -30,6 +30,7 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/certs"
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/gate"
+	"github.com/yuanying/natsumi-sentinel/internal/github"
 	"github.com/yuanying/natsumi-sentinel/internal/ledger"
 	"github.com/yuanying/natsumi-sentinel/internal/peercred"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
@@ -72,6 +73,8 @@ type world struct {
 	log    *audit.Log
 	ledger *ledger.Ledger
 	owner  http.Handler
+	// agent is the workspace's door, served here as the gate serves it.
+	agent http.Handler
 
 	mu   sync.Mutex
 	seen []*http.Request
@@ -83,14 +86,27 @@ type world struct {
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
+	return newWorldWith(t, routesYAML, func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(rw, "from upstream")
+	})
+}
+
+// newWorldWith is a world with its own routing table and upstream, which
+// answers what reaches it after it is kept.
+func newWorldWith(t *testing.T, table string, answer http.HandlerFunc) *world {
+	t.Helper()
 	w := &world{t: t, ca: testca.New(t)}
 
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
 		w.mu.Lock()
-		w.seen = append(w.seen, r.Clone(context.Background()))
+		kept := r.Clone(context.Background())
+		kept.Body = io.NopCloser(strings.NewReader(string(body)))
+		w.seen = append(w.seen, kept)
 		w.mu.Unlock()
-		rw.WriteHeader(http.StatusCreated)
-		_, _ = io.WriteString(rw, "from upstream")
+		answer(rw, r)
 	}))
 	t.Cleanup(upstream.Close)
 
@@ -150,7 +166,7 @@ credentials:
 	if err := os.Mkdir(routesDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	write("routes/routes.yaml", routesYAML)
+	write("routes/routes.yaml", table)
 	watcher, err := routes.NewWatcher(routesDir)
 	if err != nil {
 		t.Fatal(err)
@@ -172,11 +188,12 @@ credentials:
 	}
 	t.Cleanup(func() { _ = w.ledger.Close() })
 	w.owner = approvals.Owner(approvals.OwnerConfig{Ledger: w.ledger, Log: w.log})
+	w.agent = approvals.Agent(approvals.AgentConfig{Source: "workspace", Ledger: w.ledger, Log: w.log, Routes: watcher.Current})
 
 	g := gate.New(gate.Config{
 		Source:   "workspace",
 		Routes:   watcher.Current,
-		Decider:  decide.Table{Ledger: w.ledger},
+		Decider:  decide.Table{Ledger: w.ledger, GitHub: &github.Connector{Transport: tr, Log: w.log}},
 		Minter:   minter,
 		Log:      w.log,
 		Upstream: tr,
