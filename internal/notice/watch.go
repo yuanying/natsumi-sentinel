@@ -109,6 +109,7 @@ const (
 var pairWords = map[string]string{
 	PairDestination: "a destination",
 	PairWrite:       "a write",
+	PairOperation:   "an operation",
 	PairPassthrough: "a passthrough",
 	PairDeniedName:  "a name refused in name resolution",
 }

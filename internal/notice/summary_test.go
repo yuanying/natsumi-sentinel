@@ -51,18 +51,26 @@ func dayLog(t *testing.T) *audit.Log {
 		}
 	}
 	for i := range 3 {
-		write(audit.Record{Time: at.Add(time.Duration(i) * time.Minute), Kind: audit.KindHTTP, Name: "api.example.com", Method: "POST", Path: fmt.Sprintf("/repos/o/r/issues/%d/comments", i), Verdict: audit.Allow})
+		write(audit.Record{Time: at.Add(time.Duration(i) * time.Minute), Kind: audit.KindHTTP, Name: "api.example.com", Method: "POST", Path: fmt.Sprintf("/repos/o/r/issues/%d/comments", i), Operation: "issues.comment", Target: "owner=o repo=r", Verdict: audit.Allow})
 	}
 	write(audit.Record{Time: at, Kind: audit.KindHTTP, Name: "cluster.example.com", Method: "PATCH", Path: "/apis/apps/v1/namespaces/a/deployments/b", Verdict: audit.Allow})
+	write(audit.Record{Time: at, Kind: audit.KindHTTP, Name: "api.example.com", Method: "PUT", Path: "/repos/o/r/pulls/5/merge", Query: "token=never-told", Operation: "pulls.merge", Target: "owner=o repo=r", Verdict: audit.Ask, Approval: "ap-1",
+		Request: &audit.Body{Text: "a body never told", Size: 17}, Reason: "the operation pulls.merge: the table asks about it; held for the owner as ap-1"})
 	write(audit.Record{Time: at, Kind: audit.KindHTTP, Name: "api.example.com", Method: "DELETE", Path: "/repos/o/r", Verdict: audit.Deny, Reason: "the destination's default is deny"})
 	write(audit.Record{Time: at, Kind: audit.KindDNS, Name: "made-up.example.net", Verdict: audit.Deny, Reason: "not an open destination in the routing table"})
+	write(audit.Record{Time: at.Add(5 * time.Minute), Source: "workspace", Kind: audit.KindAnswer, Name: "api.example.com", Method: "PUT", Path: "/repos/o/r/pulls/5/merge", Query: "token=never-told",
+		Operation: "pulls.merge", Target: "owner=o repo=r", Verdict: audit.Allow, Approval: "ap-1", Grant: "gr-1", Reason: "the owner allowed ap-1 with the choice 1h: pulls.merge (owner=o repo=r) on api.example.com for 1h"})
+	write(audit.Record{Time: at.Add(6 * time.Minute), Source: "workspace", Kind: audit.KindAnswer, Name: "api.example.com", Method: "PUT", Path: "/repos/o/r/pulls/6/merge",
+		Operation: "pulls.merge", Target: "owner=o repo=r", Verdict: audit.Deny, Approval: "ap-2", Reason: "the owner denied ap-2"})
+	write(audit.Record{Time: at.Add(7 * time.Minute), Source: "workspace", Kind: audit.KindAnswer, Name: "api.example.com", Method: "PUT", Path: "/repos/o/r/pulls/5/merge",
+		Operation: "pulls.merge", Target: "owner=o repo=r", Verdict: audit.Deny, Approval: "ap-1", Grant: "gr-1", Reason: "the owner revoked gr-1 (the one request PUT https://api.example.com/repos/o/r/pulls/5/merge?token=never-told)"})
 	if _, err := l.MarkSeen(ctx, audit.Seen{Pair: notice.PairDestination, Key: "cluster.example.com", First: at, Record: 4}); err != nil {
 		t.Fatal(err)
 	}
 	return l
 }
 
-func TestTheSummaryTellsTheDaysWritesNewPairsAndRefusals(t *testing.T) {
+func TestTheSummaryTellsTheDaysWritesNewPairsAsksDenialsAndAnswers(t *testing.T) {
 	s, err := notice.NewSummarizer(notice.SummaryConfig{Log: dayLog(t), At: "00:00", Location: time.UTC})
 	if err != nil {
 		t.Fatal(err)
@@ -77,20 +85,31 @@ func TestTheSummaryTellsTheDaysWritesNewPairsAndRefusals(t *testing.T) {
 	}
 	for _, want := range []string{
 		"4 writes",
-		"3  api.example.com POST",
-		"1  cluster.example.com PATCH",
+		"3  api.example.com issues.comment\n",
+		"1  cluster.example.com PATCH\n",
 		"1 new pair",
 		"destination  cluster.example.com",
-		"2 refused",
-		"1  deny http api.example.com DELETE /repos/o/r: the destination's default is deny",
-		"1  deny dns made-up.example.net: not an open destination in the routing table",
+		"1 asked",
+		"1  http api.example.com pulls.merge owner=o repo=r: the operation pulls.merge: the table asks about it; held for the owner as ap-1",
+		"2 denied",
+		"1  http api.example.com DELETE /repos/o/r: the destination's default is deny",
+		"1  dns made-up.example.net: not an open destination in the routing table",
+		"3 answers",
+		"09:35 UTC  workspace  allowed ap-1: api.example.com pulls.merge owner=o repo=r; the owner allowed ap-1 with the choice 1h: pulls.merge (owner=o repo=r) on api.example.com for 1h",
+		"09:36 UTC  workspace  denied ap-2: api.example.com pulls.merge owner=o repo=r",
+		"09:37 UTC  workspace  revoked gr-1 of ap-1: api.example.com pulls.merge owner=o repo=r",
 	} {
 		if !strings.Contains(n.Description, want) {
 			t.Errorf("the summary does not say %q:\n%s", want, n.Description)
 		}
 	}
-	if !strings.Contains(n.Summary, "4 writes") {
-		t.Errorf("summary = %q", n.Summary)
+	for _, never := range []string{"never-told", "a body never told"} {
+		if strings.Contains(n.Description, never) {
+			t.Errorf("the summary tells %q:\n%s", never, n.Description)
+		}
+	}
+	if want := "4 writes, 1 new pair, 1 asked, 2 denied, 3 answers"; !strings.Contains(n.Summary, want) {
+		t.Errorf("summary = %q, want it to say %q", n.Summary, want)
 	}
 }
 

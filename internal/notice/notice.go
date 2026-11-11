@@ -1,6 +1,7 @@
 // Package notice tells the owner what is out of the ordinary, without a
 // judge (docs/adr/0006, docs/notices.md): each pair the gate sees go
-// through for the first time, and once a day a summary of the day.
+// through for the first time, each answer of the owner's it takes, and
+// once a day a summary of the day.
 //
 // The notices go to Alertmanager, through authd like any other request
 // out of the gate (docs/adr/0002), and Alertmanager takes them to the
@@ -13,6 +14,7 @@ package notice
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
@@ -24,7 +26,13 @@ const (
 	TypeFirstSeen = "first-seen"
 	// TypeDailySummary tells what a day's records count up to.
 	TypeDailySummary = "daily-summary"
+	// TypeAnswer tells one answer of the owner's, or one revocation, the
+	// gate took.
+	TypeAnswer = "answer"
 )
+
+// Types are all the types of notice.
+var Types = []string{TypeFirstSeen, TypeAnswer, TypeDailySummary}
 
 // Notice is one thing to tell.
 type Notice struct {
@@ -43,9 +51,12 @@ const (
 	// PairDestination is a name in the routing table that a request went
 	// through to.
 	PairDestination = "destination"
-	// PairWrite is a write let through: its destination, method and
-	// path.
+	// PairWrite is a write of a raw operation let through: its
+	// destination, method and path.
 	PairWrite = "write"
+	// PairOperation is a write of a named operation let through: its
+	// destination, operation and target.
+	PairOperation = "operation"
 	// PairPassthrough is an address and port passed straight through.
 	PairPassthrough = "passthrough"
 	// PairDeniedName is a name refused in name resolution.
@@ -56,8 +67,10 @@ const (
 // record of something that was not let through is no pair, apart from a
 // name refused in name resolution.
 //
-// A write is its name, method and path: the records have no operation or
-// target of their own yet. The query is not part of it.
+// A write of a named operation is its name, operation and target, so that
+// one operation on one target is one pair whatever else is in its path. A
+// write of a raw operation is its name, method and path. The query is not
+// part of either.
 func Pairs(rec *audit.Record) []audit.Seen {
 	seen := func(pair, key string) audit.Seen {
 		return audit.Seen{Pair: pair, Key: key, First: rec.Time, Record: rec.ID}
@@ -65,7 +78,11 @@ func Pairs(rec *audit.Record) []audit.Seen {
 	switch {
 	case rec.Kind == audit.KindHTTP && rec.Verdict == audit.Allow:
 		out := []audit.Seen{seen(PairDestination, rec.Name)}
-		if isWrite(rec.Method) {
+		switch {
+		case !isWrite(rec.Method):
+		case rec.Operation != "":
+			out = append(out, seen(PairOperation, strings.Join(nonEmpty(rec.Name, rec.Operation, rec.Target), " ")))
+		default:
 			out = append(out, seen(PairWrite, rec.Name+" "+rec.Method+" "+rec.Path))
 		}
 		return out

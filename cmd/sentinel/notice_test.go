@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yuanying/natsumi-sentinel/internal/ledger"
+	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
 
 // fakeAlertmanager stands for authd's side of the sender, answering the
@@ -135,5 +140,53 @@ func TestNoticeSettingsThatCannotBeUsedDoNotStopTheGate(t *testing.T) {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr does not name %q: %s", want, stderr)
 		}
+	}
+}
+
+func TestTheOwnersAnswerIsToldToAlertmanagerAndTheApprovalsWaitingAreCounted(t *testing.T) {
+	am := withAlertmanager(t)
+	s := newSetup(t)
+	book, err := ledger.Open(s.ledger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _, err := book.Hold(context.Background(), ledger.Facts{
+		Source: "workspace", Destination: "api.example.com", Method: "POST", Path: "/markdown",
+		Fingerprint: "fp", Exact: true,
+	}, routes.ApprovalSettings{Durations: []time.Duration{time.Hour}, Once: 10 * time.Minute, Pending: 24 * time.Hour})
+	_ = book.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := startGate(t, s, []string{"workspace/dns-udp", "metrics"},
+		"-metrics-listen", "127.0.0.1:0",
+		"-alertmanager-url", "https://alerts.example.com")
+	if page := r.metrics(); !strings.Contains(page, "sentinel_approvals_pending 1\n") {
+		t.Errorf("the metrics do not count the approval waiting:\n%s", page)
+	}
+
+	oc := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", s.approvals)
+	}}, Timeout: 5 * time.Second}
+	resp, err := oc.Post("http://sentinel/v1/approvals/"+a.ID+"/answer", "application/json", strings.NewReader(`{"answer":"allow","choice":"1h"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("answer = %d", resp.StatusCode)
+	}
+
+	alerts := am.wait(t)
+	labels, _ := alerts[0]["labels"].(map[string]any)
+	for k, v := range map[string]string{"alertname": "SentinelAnswer", "answer": "allowed", "approval": a.ID, "source": "workspace"} {
+		if labels[k] != v {
+			t.Errorf("label %s = %v, want %s", k, labels[k], v)
+		}
+	}
+	if page := r.metrics(); !strings.Contains(page, "sentinel_approvals_pending 0\n") {
+		t.Errorf("the metrics still count the approval answered:\n%s", page)
 	}
 }

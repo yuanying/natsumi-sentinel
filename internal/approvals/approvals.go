@@ -44,6 +44,10 @@ type OwnerConfig struct {
 	// 30s.
 	Ping time.Duration
 	Now  func() time.Time
+	// Answered is told each answer once it has taken effect, and Revoked
+	// each revocation with its time (docs/notices.md). Either may be nil.
+	Answered func(*ledger.Approval)
+	Revoked  func(g *ledger.Grant, at time.Time)
 }
 
 // maxBody bounds what the doors read of a request body.
@@ -143,6 +147,9 @@ func (o *owner) answer(w http.ResponseWriter, r *http.Request) {
 		writeLedgerError(w, err)
 		return
 	}
+	if o.cfg.Answered != nil {
+		o.cfg.Answered(a)
+	}
 	writeJSON(w, http.StatusOK, a)
 }
 
@@ -181,11 +188,14 @@ func (o *owner) listGrants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (o *owner) revoke(w http.ResponseWriter, r *http.Request) {
-	var revoked *ledger.Grant
+	var (
+		revoked *ledger.Grant
+		at      time.Time
+	)
 	err := o.cfg.Ledger.Revoke(r.Context(), r.PathValue("id"), func(g *ledger.Grant) error {
-		revoked = g
+		revoked, at = g, o.cfg.Now()
 		return o.cfg.Log.Write(context.WithoutCancel(r.Context()), &audit.Record{
-			Time: o.cfg.Now(), Source: g.Source, Kind: audit.KindAnswer, Verdict: audit.Deny,
+			Time: at, Source: g.Source, Kind: audit.KindAnswer, Verdict: audit.Deny,
 			Name: g.Destination, Operation: g.Operation, Target: g.Target, Method: g.Method, Path: g.Path,
 			Approval: g.Approval, Grant: g.ID,
 			Reason: fmt.Sprintf("the owner revoked %s (%s)", g.ID, g.Summary),
@@ -194,6 +204,9 @@ func (o *owner) revoke(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeLedgerError(w, err)
 		return
+	}
+	if o.cfg.Revoked != nil {
+		o.cfg.Revoked(revoked, at)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": revoked})
 }
