@@ -58,6 +58,21 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 - `answer` の記録の `verdict` は、許した答えが `allow`、断った答えと取り消しが `deny` である。`name`・`operation`・`target`・`method`・`path` は、承認待ちの最初の中身か、取り消した許しのものを入れる。
 - `agent` の記録の `verdict` は `ask` で、`approval` に作った承認待ちの id が入る。
 
+## 接続の記録
+
+接続の記録（`kind` が `connection`）は、要求を 1 つも読まないまま終わった接続である。ほとんどは断った接続で、`verdict` は `deny` である。元の宛先が分からない、passthrough でない宛先に何も送られない・TLS でも HTTP でもない、平文の HTTP、TLS に SNI が無い、振り分けで開かない名前やポート、TLS の握手の失敗、開く宛先への TLS の上で要求として読めないものが送られた（Host が無い、HTTP/1.1 でない）、のどれかである。
+
+ただ 1 つ、断ったのではない接続がある。
+
+| `reason` | `verdict` | いつ |
+|---|---|---|
+| `the connection was closed before anything was sent on it` | `allow` | 開く宛先へ TLS を張り終えた後、何も送られないまま閉じた |
+
+- HTTP の client は、要求のために接続を張りに行き、先に空いた別の接続で要求を送ったときは、張った接続を使わずに置いておき、後で閉じる（Go の `net/http` など）。道具が終わるときにも閉じる。この接続では何も頼まれていないので、断ってはいない。関所を通ったものはすべて残す（ADR-0006）ので記録には残すが、`verdict` は `allow` にして、断ったものと分ける。
+- 開く宛先の名前で TLS を張れたことは確かなので、`name` と `treatment`（`open`）が入る。何も送られなかったので、`method` と `path` は空である。
+- 名前の分からない接続（TLS を張る前に閉じた、SNI が無い）と、TLS を張った後に何かを送ったが要求として読めなかった接続は、これまでどおり `deny` である。
+- この版より前の関所は、この接続を `deny` と「no request was read on the connection (no Host, or not HTTP/1.1)」で残していた。前の版が残した記録は書き直さない。
+
 ## 名前解決の記録の理由
 
 名前解決の記録（`kind` が `dns`）の `reason` は、次のどれかである。断った問い合わせの理由は、どれも「not an open destination in the routing table」で始まる（分ける前の版の文で、それを探すものが引き続き見つけられるように）。

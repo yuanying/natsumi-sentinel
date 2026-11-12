@@ -32,9 +32,10 @@ type Kind string
 const (
 	// KindHTTP is one request read on an open destination.
 	KindHTTP Kind = "http"
-	// KindConnection is a connection refused before any request was read:
-	// a destination not opened, TLS without a name, plain HTTP, or
-	// something that is neither.
+	// KindConnection is a connection that ended before any request was
+	// read: one refused (a destination not opened, TLS without a name,
+	// plain HTTP, or something that is neither), or one to an open
+	// destination nothing was sent on (ReasonConnectionUnused).
 	KindConnection Kind = "connection"
 	// KindPassthrough is a connection let straight through.
 	KindPassthrough Kind = "passthrough"
@@ -76,6 +77,12 @@ const (
 	// (docs/notices.md).
 	ReasonDNSSearchSuffix = "not an open destination in the routing table: a name in the table with a search suffix added"
 )
+
+// ReasonConnectionUnused is a TLS connection to an open destination that
+// closed before anything was sent on it: a tool that opened a connection
+// ahead of a request it then sent on another, or did not send at all. It
+// was not refused, so its verdict is allow (docs/audit.md).
+const ReasonConnectionUnused = "the connection was closed before anything was sent on it"
 
 // Body is what is kept of a request body: the text up to the limit, and the
 // size and hash of the whole. A body that is not text keeps only the size

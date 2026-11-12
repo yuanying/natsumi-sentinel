@@ -869,3 +869,15 @@ func TestAPassthroughThatCannotBeRecordedIsNotConnected(t *testing.T) {
 		t.Errorf("read %d bytes through a passthrough that was not recorded", n)
 	}
 }
+
+// has reports whether a finished record satisfies ok now.
+func (m *memLog) has(ok func(*audit.Record) bool) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.records {
+		if r.Finished && ok(r) {
+			return true
+		}
+	}
+	return false
+}

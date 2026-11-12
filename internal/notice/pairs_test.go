@@ -93,6 +93,10 @@ func TestThePairsOfARecord(t *testing.T) {
 			audit.Record{Kind: audit.KindConnection, Treatment: "deny", Name: "made-up.example.net", Verdict: audit.Deny},
 			"[]",
 		},
+		"a connection closed before anything was sent on it is no pair": {
+			audit.Record{Kind: audit.KindConnection, Treatment: "open", Name: "api.example.com", Verdict: audit.Allow, Reason: audit.ReasonConnectionUnused},
+			"[]",
+		},
 		"the gate's own request is no pair": {
 			audit.Record{Kind: audit.KindGate, Name: "alerts.example.com", Method: "POST", Path: "/api/v2/alerts", Verdict: audit.Allow},
 			"[]",
