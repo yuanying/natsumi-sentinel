@@ -26,6 +26,12 @@ type AlertmanagerConfig struct {
 	// URL is Alertmanager's base, https. The alerts are posted to
 	// /api/v2/alerts under it.
 	URL string
+	// Surrogate, when set, is put on every request as
+	// "Authorization: Bearer <surrogate>", for authd to swap for the key
+	// of an Alertmanager behind a door that wants one (docs/adr/0003). It
+	// is not a secret, but it is not told in records, logs or errors
+	// either: there is no need to.
+	Surrogate string
 	// Transport sends the requests. In the gate it is the sender to
 	// authd, the same one the workspace's requests go through.
 	Transport http.RoundTripper
@@ -61,6 +67,9 @@ func NewAlertmanager(cfg AlertmanagerConfig) (*Alertmanager, error) {
 		return nil, errors.New("the Alertmanager URL must be https://name[:port][/path]")
 	case u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.HasSuffix(cfg.URL, "#"):
 		return nil, errors.New("the Alertmanager URL may not carry a user, a query or a fragment")
+	}
+	if cfg.Surrogate != "" && !bearerValue(cfg.Surrogate) {
+		return nil, errors.New("the Alertmanager surrogate must be visible ASCII characters with no spaces")
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/") + "/api/v2/alerts"
 	u.RawPath = ""
@@ -142,6 +151,9 @@ func (a *Alertmanager) Send(ctx context.Context, notices []Notice) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if a.cfg.Surrogate != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.Surrogate)
+	}
 	resp, err := a.client.Do(req)
 	if err != nil {
 		rec.Error = err.Error()
@@ -170,4 +182,15 @@ func (a *Alertmanager) kept(body []byte) *audit.Body {
 	_, _ = io.Copy(io.Discard, r)
 	s := c.Summary()
 	return &s
+}
+
+// bearerValue reports whether s can follow "Bearer " as it is: visible
+// ASCII, with no spaces.
+func bearerValue(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] <= ' ' || s[i] > '~' {
+			return false
+		}
+	}
+	return true
 }

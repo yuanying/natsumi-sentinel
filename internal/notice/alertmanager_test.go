@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -217,5 +218,63 @@ func TestAnAnswerIsAnAlertOfItsOwnName(t *testing.T) {
 	}
 	if l := alerts[0].Labels; l["alertname"] != "SentinelAnswer" || l["answer"] != "allowed" || l["approval"] != "ap-1" || l["severity"] != "info" {
 		t.Errorf("labels = %v", l)
+	}
+}
+
+const noticeSurrogate = "surrogate-for-the-notices-0123456789"
+
+// sendOne sends one notice through a sender with the surrogate given, and
+// gives the request that was sent and the records written.
+func sendOne(t *testing.T, surrogate string) (*http.Request, *recLog) {
+	t.Helper()
+	var got *http.Request
+	log := &recLog{}
+	am, err := notice.NewAlertmanager(notice.AlertmanagerConfig{
+		URL:       "https://alerts.example.com",
+		Surrogate: surrogate,
+		Transport: tripper(func(r *http.Request) (*http.Response, error) {
+			got = r
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: http.Header{}}, nil
+		}),
+		Log: log,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := am.Send(context.Background(), []notice.Notice{firstSeen("a.example.com")}); err != nil {
+		t.Fatal(err)
+	}
+	return got, log
+}
+
+func TestWithASurrogateTheNoticesCarryItAsABearerAndTheRecordDoesNot(t *testing.T) {
+	got, log := sendOne(t, noticeSurrogate)
+	if a := got.Header.Values("Authorization"); len(a) != 1 || a[0] != "Bearer "+noticeSurrogate {
+		t.Errorf("Authorization = %q, want the surrogate as a bearer", a)
+	}
+	for _, rec := range append(log.begun, log.done...) {
+		if s := fmt.Sprintf("%+v %+v", rec, rec.Request); strings.Contains(s, noticeSurrogate) {
+			t.Errorf("the record carries the surrogate: %s", s)
+		}
+	}
+}
+
+func TestWithoutASurrogateTheNoticesCarryNoAuthorization(t *testing.T) {
+	got, _ := sendOne(t, "")
+	if a := got.Header.Values("Authorization"); len(a) != 0 {
+		t.Errorf("Authorization = %q, want none", a)
+	}
+}
+
+func TestASurrogateThatCannotBeABearerIsNotTakenAndNotTold(t *testing.T) {
+	for _, s := range []string{"has a space-0123456789", "line-0123456789\r\nX-Other: 1", "tab-0123456789\there", "non-ascii-0123456789é", "del-0123456789\x7f"} {
+		_, err := notice.NewAlertmanager(notice.AlertmanagerConfig{URL: "https://alerts.example.com", Surrogate: s, Transport: http.DefaultTransport, Log: &recLog{}})
+		if err == nil {
+			t.Errorf("NewAlertmanager(surrogate %q) = nil error", s)
+			continue
+		}
+		if strings.Contains(err.Error(), s) {
+			t.Errorf("the error tells the surrogate: %v", err)
+		}
 	}
 }

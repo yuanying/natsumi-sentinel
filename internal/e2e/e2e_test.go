@@ -79,6 +79,9 @@ type world struct {
 	mu   sync.Mutex
 	seen []*http.Request
 
+	// authd is the gate's sender to authd's socket.
+	authd *authdclient.Transport
+
 	gateAddr  string
 	routesDir string
 	watcher   *routes.Watcher
@@ -188,6 +191,7 @@ credentials:
 	t.Cleanup(func() { _ = srv.Close() })
 	tr := authdclient.NewTransport(sock)
 	t.Cleanup(tr.CloseIdleConnections)
+	w.authd = tr
 
 	routesDir := filepath.Join(dir, "routes")
 	if err := os.Mkdir(routesDir, 0o700); err != nil {

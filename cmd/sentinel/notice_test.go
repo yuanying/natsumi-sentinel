@@ -22,6 +22,7 @@ import (
 type fakeAlertmanager struct {
 	mu     sync.Mutex
 	posts  []string
+	auths  [][]string
 	posted chan struct{}
 }
 
@@ -35,6 +36,7 @@ func withAlertmanager(t *testing.T) *fakeAlertmanager {
 			if r.URL.Host == "alerts.example.com" && r.URL.Path == "/api/v2/alerts" && r.Method == http.MethodPost {
 				am.mu.Lock()
 				am.posts = append(am.posts, string(b))
+				am.auths = append(am.auths, r.Header.Values("Authorization"))
 				am.mu.Unlock()
 				am.posted <- struct{}{}
 			}
@@ -253,5 +255,95 @@ func TestAnAnswerToAPushOfTwoRefsTellsBothOperationsAndNotWhatTheGateLookedUp(t 
 		if strings.Contains(summary+description, s) {
 			t.Errorf("the notice tells %q:\n%s\n%s", s, summary, description)
 		}
+	}
+}
+
+const noticeSurrogate = "surrogate-for-the-notices-0123456789"
+
+func TestTheSurrogateGivenIsPutOnTheNoticesAndKeptOutOfTheLogsAndRecords(t *testing.T) {
+	am := withAlertmanager(t)
+	s := newSetup(t)
+	r := startGate(t, s, []string{"workspace/dns-udp"},
+		"-alertmanager-url", "https://alerts.example.com",
+		"-alertmanager-surrogate", noticeSurrogate)
+	r.query("made-up.example.net")
+	am.wait(t)
+	if code := r.stop(); code != 0 {
+		t.Fatalf("run = %d; stderr: %s", code, r.stderr.String())
+	}
+	am.mu.Lock()
+	auth := am.auths[0]
+	am.mu.Unlock()
+	if len(auth) != 1 || auth[0] != "Bearer "+noticeSurrogate {
+		t.Errorf("Authorization = %q, want the surrogate as a bearer", auth)
+	}
+	if strings.Contains(r.stderr.String(), noticeSurrogate) {
+		t.Errorf("stderr tells the surrogate: %s", r.stderr.String())
+	}
+
+	db, err := sql.Open("sqlite", s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM records WHERE kind = 'gate' AND name = 'alerts.example.com'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("records of the notice sent = %d, %v; want 1", n, err)
+	}
+	// stdout is the copy of every record, each in full.
+	if out := r.stdout.String(); !strings.Contains(out, "alerts.example.com") || strings.Contains(out, noticeSurrogate) {
+		t.Errorf("the copy of the records = %s, want the notice's record without the surrogate", out)
+	}
+}
+
+func TestWithoutASurrogateTheNoticesCarryNoAuthorization(t *testing.T) {
+	am := withAlertmanager(t)
+	r := startGate(t, newSetup(t), []string{"workspace/dns-udp"},
+		"-alertmanager-url", "https://alerts.example.com")
+	r.query("made-up.example.net")
+	am.wait(t)
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	if len(am.auths[0]) != 0 {
+		t.Errorf("Authorization = %q, want none", am.auths[0])
+	}
+}
+
+func TestASurrogateWithoutAnAlertmanagerURLIsNotUsedAndDoesNotStopTheGate(t *testing.T) {
+	withUpstream(t)
+	r := startGate(t, newSetup(t), []string{"workspace/dns-udp", "metrics"},
+		"-metrics-listen", "127.0.0.1:0",
+		"-alertmanager-surrogate", noticeSurrogate)
+	if rc := r.query("made-up.example.net"); rc != 3 {
+		t.Errorf("rcode = %v, want NXDOMAIN from a gate that runs", rc)
+	}
+	if !strings.Contains(r.metrics(), "sentinel_notice_sender_configured 0\n") {
+		t.Error("the metrics do not say the notices are not sent")
+	}
+	stderr := r.stderr.String()
+	if !strings.Contains(stderr, "-alertmanager-surrogate") {
+		t.Errorf("stderr does not say the surrogate is not used: %s", stderr)
+	}
+	if strings.Contains(stderr, noticeSurrogate) {
+		t.Errorf("stderr tells the surrogate: %s", stderr)
+	}
+}
+
+func TestASurrogateThatCannotBeABearerLeavesTheNoticesOnlyLoggedAndIsNotTold(t *testing.T) {
+	withAlertmanager(t)
+	const bad = "surrogate with spaces 0123456789"
+	r := startGate(t, newSetup(t), []string{"workspace/dns-udp", "metrics"},
+		"-metrics-listen", "127.0.0.1:0",
+		"-alertmanager-url", "https://alerts.example.com",
+		"-alertmanager-surrogate", bad)
+	if rc := r.query("made-up.example.net"); rc != 3 {
+		t.Errorf("rcode = %v, want NXDOMAIN from a gate that runs", rc)
+	}
+	if !strings.Contains(r.metrics(), "sentinel_notice_sender_configured 0\n") {
+		t.Error("the metrics do not say the notices are not sent")
+	}
+	stderr := r.stderr.String()
+	if !strings.Contains(stderr, "-alertmanager-surrogate") || strings.Contains(stderr, bad) {
+		t.Errorf("stderr = %s, want it to name the flag and not the value", stderr)
 	}
 }
