@@ -234,3 +234,174 @@ func TestAMetricsAddressThatCannotBeListenedOnStopsTheStart(t *testing.T) {
 		t.Errorf("stderr %q does not say the metrics are the trouble", stderr.String())
 	}
 }
+
+const (
+	testSurrogate = "surrogate-0123456789abcdef"
+	testKey       = "real-key-for-the-test-only"
+)
+
+// withCredential rewrites the registration at config with a second upstream
+// and one credential whose key is at keyFile, which need not exist.
+func withCredential(t *testing.T, config, keyFile, caFile string) {
+	t.Helper()
+	text := "upstreams:\n  - name: api.example.com\n"
+	if caFile != "" {
+		text += "    ca_file: " + caFile + "\n"
+	}
+	text += "credentials:\n  - surrogate: " + testSurrogate + "\n    key_file: " + keyFile + "\n    upstreams: [api.example.com]\n    places:\n      - type: bearer\n"
+	if err := os.WriteFile(config, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// startAuthd runs authd with the metrics on until the test ends, and
+// returns the metrics' address.
+func startAuthd(t *testing.T, config, socket string) (net.Addr, *syncBuffer) {
+	t.Helper()
+	addrs := make(chan net.Addr, 1)
+	old := onMetricsListen
+	onMetricsListen = func(a net.Addr) { addrs <- a }
+	t.Cleanup(func() { onMetricsListen = old })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stderr := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"--config", config, "--socket", socket, "--peer-uid", strconv.Itoa(os.Getuid()), "--metrics-listen", "127.0.0.1:0"}, &bytes.Buffer{}, stderr)
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	var addr net.Addr
+	select {
+	case addr = <-addrs:
+	case code := <-done:
+		done <- code
+		t.Fatalf("run = %d before listening; stderr: %s", code, stderr.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("the metrics were not listened for")
+	}
+	waitForSocket(t, socket, stderr)
+	return addr, stderr
+}
+
+func metricsPage(t *testing.T, addr net.Addr) string {
+	t.Helper()
+	resp, err := http.Get("http://" + addr.String() + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
+func TestAKeyFileThatCannotBeReadAtTheStartDoesNotStopTheStart(t *testing.T) {
+	config, socket := setup(t)
+	keyFile := filepath.Join(t.TempDir(), "missing-key")
+	withCredential(t, config, keyFile, "")
+
+	addr, stderr := startAuthd(t, config, socket)
+
+	logs := stderr.String()
+	if !strings.Contains(logs, "credentials[0]") && !strings.Contains(logs, `"credential":0`) {
+		t.Errorf("the logs %q do not name the credential by its position", logs)
+	}
+	if !strings.Contains(logs, keyFile) {
+		t.Errorf("the logs %q do not name the key file", logs)
+	}
+	if strings.Contains(logs, testSurrogate) {
+		t.Errorf("the logs %q show the surrogate", logs)
+	}
+	if page := metricsPage(t, addr); !strings.Contains(page, `authd_key_read_failures_total{credential="0"} 1`) {
+		t.Errorf("the metrics do not count the key that could not be read at the start:\n%s", page)
+	}
+
+	tr := authdclient.NewTransport(socket)
+	defer tr.CloseIdleConnections()
+	req, _ := http.NewRequest(http.MethodGet, "https://api.example.com/", nil)
+	req.Header.Set("Authorization", "Bearer "+testSurrogate)
+	_, err := tr.RoundTrip(req)
+	var aerr *authdclient.Error
+	if !errors.As(err, &aerr) || aerr.Reason != authdclient.ReasonCredentialUnavailable {
+		t.Fatalf("RoundTrip = %v, want the request that uses the key refused as credential-unavailable", err)
+	}
+}
+
+func TestCheckSaysAUsableRegistrationCanBeUsedWithoutListening(t *testing.T) {
+	config, socket := setup(t)
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(--check) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "can be used") {
+		t.Errorf("stdout %q does not say the registration can be used", stdout.String())
+	}
+	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the socket exists: %v", err)
+	}
+}
+
+func TestCheckFailsOnARegistrationThatCannotBeUsed(t *testing.T) {
+	for name, text := range map[string]string{
+		"broken YAML":   "upstreams: [",
+		"unknown field": "upstreams:\n  - name: api.example.com\n    nmae: x\n",
+		"no upstreams":  "upstreams: []\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			config, _ := setup(t)
+			if err := os.WriteFile(config, []byte(text), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr); code != 1 {
+				t.Fatalf("run(--check) = %d, want 1", code)
+			}
+			if !strings.Contains(stderr.String(), "registration") {
+				t.Errorf("stderr %q does not say the registration is the trouble", stderr.String())
+			}
+		})
+	}
+}
+
+func TestCheckFailsOnACAFileThatCannotBeRead(t *testing.T) {
+	config, _ := setup(t)
+	keyFile := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyFile, []byte(testKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withCredential(t, config, keyFile, filepath.Join(t.TempDir(), "missing-ca.pem"))
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr); code != 1 {
+		t.Fatalf("run(--check) = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "ca_file") {
+		t.Errorf("stderr %q does not name ca_file", stderr.String())
+	}
+}
+
+func TestCheckDoesNotFailOnAKeyFileThatIsNotThereButSaysSo(t *testing.T) {
+	config, _ := setup(t)
+	keyFile := filepath.Join(t.TempDir(), "missing-key")
+	withCredential(t, config, keyFile, "")
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--check", "--config", config}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(--check) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "credentials[0]") || !strings.Contains(out, keyFile) {
+		t.Errorf("stdout %q does not name the key file that cannot be read", out)
+	}
+	if strings.Contains(out+stderr.String(), testSurrogate) {
+		t.Errorf("the output shows the surrogate")
+	}
+}
+
+func TestCheckNeedsOnlyTheConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--check"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("run(--check) without --config = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "config") {
+		t.Errorf("stderr %q does not name --config", stderr.String())
+	}
+}

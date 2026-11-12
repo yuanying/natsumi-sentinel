@@ -58,10 +58,14 @@
 | 場面 | 答え |
 |---|---|
 | 振り分けで `open` の名前の A | 本物の IPv4 の答え（TTL 30 秒） |
-| 振り分けで `open` の名前の A 以外（AAAA を含む） | NOERROR、答えなし |
+| 振り分けで `open` の名前の AAAA（IPv6 を向け直している向け直し元） | 本物の IPv6 の答え（TTL 30 秒） |
+| 振り分けで `open` の名前の AAAA（IPv6 を向け直していない向け直し元） | NOERROR、答えなし |
+| 振り分けで `open` の名前の A・AAAA 以外 | NOERROR、答えなし |
+| IPv6 を向け直していて、`open` の名前が問い合わせの型のアドレスを持たず、もう片方の型だけを持つ | NOERROR、答えなし |
 | 関所の固定の名前（`-gate-name`）の A | `-gate-address` |
-| それ以外の名前 | NXDOMAIN |
-| `open` の名前が上流の DNS に無い | NXDOMAIN |
+| 関所の固定の名前の AAAA | NOERROR、答えなし |
+| それ以外の名前（振り分けで deny の名前、振り分けに無い名前、`-dns-search-suffix` の接尾辞を付けた名前を含む） | NXDOMAIN |
+| `open` の名前が上流の DNS に無い（IPv6 を向け直していれば、A も AAAA も無い） | NXDOMAIN |
 | 上流の DNS が答えない | SERVFAIL |
 | 記録が書けない | SERVFAIL |
 

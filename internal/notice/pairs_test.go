@@ -65,9 +65,25 @@ func TestThePairsOfARecord(t *testing.T) {
 			audit.Record{Kind: audit.KindPassthrough, Address: "192.0.2.10:5432", Verdict: audit.Allow},
 			"[passthrough=192.0.2.10:5432]",
 		},
+		"an IPv6 passthrough is its address and port": {
+			audit.Record{Kind: audit.KindPassthrough, Address: "[2001:db8::10]:22", Verdict: audit.Allow},
+			"[passthrough=[2001:db8::10]:22]",
+		},
 		"a name refused in name resolution": {
 			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "made-up.example.net", Verdict: audit.Deny},
 			"[denied-name=made-up.example.net]",
+		},
+		"a name the table denies is the same pair as one not in the table": {
+			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "blocked.example.com", Verdict: audit.Deny, Reason: audit.ReasonDNSDenied},
+			"[denied-name=blocked.example.com]",
+		},
+		"a name not in the table, by its reason": {
+			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "made-up.example.net", Verdict: audit.Deny, Reason: audit.ReasonDNSNotListed},
+			"[denied-name=made-up.example.net]",
+		},
+		"a name in the table with a search suffix added is no pair": {
+			audit.Record{Kind: audit.KindDNS, Treatment: "deny", Name: "api.example.com.ns.svc.cluster.example", Verdict: audit.Deny, Reason: audit.ReasonDNSSearchSuffix},
+			"[]",
 		},
 		"a name answered is no pair": {
 			audit.Record{Kind: audit.KindDNS, Treatment: "open", Name: "api.example.com", Verdict: audit.Allow},

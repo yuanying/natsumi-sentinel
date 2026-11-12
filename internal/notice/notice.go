@@ -88,7 +88,7 @@ func Pairs(rec *audit.Record) []audit.Seen {
 		return out
 	case rec.Kind == audit.KindPassthrough && rec.Verdict == audit.Allow:
 		return []audit.Seen{seen(PairPassthrough, rec.Address)}
-	case rec.Kind == audit.KindDNS && rec.Verdict == audit.Deny && rec.Name != "":
+	case rec.Kind == audit.KindDNS && rec.Verdict == audit.Deny && rec.Name != "" && rec.Reason != audit.ReasonDNSSearchSuffix:
 		return []audit.Seen{seen(PairDeniedName, rec.Name)}
 	}
 	return nil

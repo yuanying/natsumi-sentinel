@@ -3,7 +3,9 @@
 // surrogates for their real keys on the way (docs/adr/0001, 0003).
 //
 // authd listens on a Unix socket and takes connections only from the gate's
-// UID. It does not start on a registration it cannot use.
+// UID. It does not start on a registration it cannot use, but a key file
+// that cannot be read only refuses the requests that use it. --check checks
+// the registration and exits.
 package main
 
 import (
@@ -50,6 +52,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(program, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	showVersion := fs.Bool("version", false, "print the version and exit")
+	check := fs.Bool("check", false, "check the registration in --config and its CA files, and exit; a key file that cannot be read is told but is not an error")
 	configPath := fs.String("config", "", "the registration of surrogates and upstreams (required)")
 	socketPath := fs.String("socket", "", "the Unix socket to listen on (required)")
 	peerUID := fs.Int("peer-uid", -1, "the gate's UID, the only one whose connections are taken (required)")
@@ -66,9 +69,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	switch {
-	case *configPath == "":
+	if *configPath == "" {
 		return usage(stderr, "--config is required")
+	}
+	if *check {
+		return checkConfig(*configPath, stdout, stderr)
+	}
+	switch {
 	case *socketPath == "":
 		return usage(stderr, "--socket is required")
 	case *peerUID < 0:
@@ -82,6 +89,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	m := newAuthdMetrics(cfg.Credentials())
+	// A key that cannot be read does not stop the start: the requests that
+	// use it are refused, as they are when it cannot be read later.
+	for _, k := range cfg.UnreadableKeys() {
+		log.Warn("a real key cannot be read at the start; the requests that use it are refused until it can be",
+			"credential", k.Credential, "key_file", k.KeyFile, "error", k.Problem)
+		m.onKeyUnreadable(k.Credential)
+	}
 	handler, err := authd.NewHandler(cfg, authd.Options{
 		Logger:          log,
 		OnError:         m.onError,
@@ -145,6 +159,23 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		_ = srv.Close()
 	}
 	log.Info("stopped")
+	return 0
+}
+
+// checkConfig loads the registration as the start does, and says whether it
+// can be used. A key file that cannot be read is told, but is not an error:
+// the start does not stop on one, and a check is run where the keys are
+// not (a CI, say).
+func checkConfig(path string, stdout, stderr io.Writer) int {
+	cfg, err := authd.LoadConfig(path)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: the registration cannot be used: %v\n", program, err)
+		return 1
+	}
+	_, _ = fmt.Fprintf(stdout, "the registration in %s can be used\n", path)
+	for _, k := range cfg.UnreadableKeys() {
+		_, _ = fmt.Fprintf(stdout, "credentials[%d]: key_file %s: %s; the requests that use it would be refused\n", k.Credential, k.KeyFile, k.Problem)
+	}
 	return 0
 }
 

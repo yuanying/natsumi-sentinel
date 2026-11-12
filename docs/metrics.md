@@ -82,7 +82,7 @@
 |---|---|---|---|
 | `authd_refusals_total` | counter | `reason`（`upstream-not-registered`・`surrogate-mismatch`・`credential-unavailable`・`bad-request`） | authd が自分の確かめで断り、上流に何も送らなかった数 |
 | `authd_upstream_failures_total` | counter | `reason`（`upstream-unreachable`・`upstream-certificate`・`upstream-failed`） | 確かめを通ったが、上流の答えが得られなかった数 |
-| `authd_key_read_failures_total` | counter | `credential` | 使うときに本物の鍵のファイルが読めなかった数。`credential` は登録の `credentials` の中の位置（最初が `0`） |
+| `authd_key_read_failures_total` | counter | `credential` | 起動のとき、または使うときに、本物の鍵のファイルが読めなかった数。起動のときに読めなかった鍵は、起動の直後から 1 になる。`credential` は登録の `credentials` の中の位置（最初が `0`） |
 | `authd_refused_peers_total` | counter | なし | 関所の UID でない相手からの接続を、何も読まずに閉じた数 |
 
 - 鍵のファイルは使うたびに読み直す（[authd の登録の形式](authd-registration.md) の「鍵のファイル」）。kubelet が Secret や projected の token を作り直せなかったときは、ここに出る。

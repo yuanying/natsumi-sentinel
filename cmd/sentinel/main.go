@@ -68,9 +68,12 @@ func main() {
 }
 
 // source is one listener pair: where the connections and the name
-// resolution redirected from one place arrive (docs/adr/0002).
+// resolution redirected from one place arrive (docs/adr/0002). proxy6 and
+// dns6 are where its IPv6 arrives, when that is redirected too; then the
+// open names are answered in AAAA (docs/redirect.md).
 type source struct {
 	name, proxy, dns string
+	proxy6, dns6     string
 }
 
 type sourceFlag []source
@@ -91,12 +94,28 @@ func (s *sourceFlag) Set(v string) error {
 			src.proxy = val
 		case "dns":
 			src.dns = val
+		case "proxy6":
+			src.proxy6 = val
+		case "dns6":
+			src.dns6 = val
 		default:
 			return fmt.Errorf("unknown key %q", k)
 		}
 	}
 	if src.name == "" || src.proxy == "" || src.dns == "" {
 		return errors.New("name, proxy and dns are all required")
+	}
+	if (src.proxy6 == "") != (src.dns6 == "") {
+		return errors.New("proxy6 and dns6 go together")
+	}
+	for k, v := range map[string]string{"proxy6": src.proxy6, "dns6": src.dns6} {
+		if v == "" {
+			continue
+		}
+		ap, err := netip.ParseAddrPort(v)
+		if err != nil || !ap.Addr().Is6() || ap.Addr().Is4In6() {
+			return fmt.Errorf("%s %q is not an IPv6 address and port, such as [::1]:15002", k, v)
+		}
 	}
 	for _, o := range *s {
 		if o.name == src.name {
@@ -114,6 +133,7 @@ type options struct {
 	approvalsUID              int
 	sources                   sourceFlag
 	gateName, gateAddress     string
+	searchSuffixes            listFlag
 	reload                    time.Duration
 	metrics                   string
 	notices                   noticeOptions
@@ -152,9 +172,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.ledger, "ledger", "", "the SQLite file of the ledger of approvals and grants; its directory must exist")
 	fs.StringVar(&o.approvalsSocket, "approvals-socket", "", "the Unix socket the owner's door (natsumi's server) is served on")
 	fs.IntVar(&o.approvalsUID, "approvals-peer-uid", -1, "the server's UID, the only one taken on -approvals-socket")
-	fs.Var(&o.sources, "source", "a listener pair, name=NAME,proxy=ADDR,dns=ADDR; repeat for each place redirected from")
+	fs.Var(&o.sources, "source", "a listener pair, name=NAME,proxy=ADDR,dns=ADDR, with proxy6=ADDR,dns6=ADDR when IPv6 is redirected too; repeat for each place redirected from")
 	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution; the workspace's door is http://NAME/")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
+	fs.Var(&o.searchSuffixes, "dns-search-suffix", "a search suffix of the workspace's resolver, such as svc.cluster.local; a refused name in the table with it added is recorded but not noticed; repeat for each")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
 	fs.StringVar(&o.notices.alertmanager, "alertmanager-url", "", "Alertmanager's https base URL, reached through authd, to send the notices to; empty only logs them")
@@ -219,6 +240,11 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 	case o.reload <= 0:
 		return nil, errors.New("-reload-interval must be positive")
 	}
+	for _, sfx := range o.searchSuffixes {
+		if !validSuffix(sfx) {
+			return nil, fmt.Errorf("-dns-search-suffix %q is not a name", sfx)
+		}
+	}
 	if (o.gateName == "") != (o.gateAddress == "") {
 		return nil, errors.New("-gate-name and -gate-address go together")
 	}
@@ -230,6 +256,22 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 		return nil, fmt.Errorf("-gate-address %q is not an IPv4 address", o.gateAddress)
 	}
 	return map[string]netip.Addr{o.gateName: addr}, nil
+}
+
+// validSuffix reports whether s is a name to take as a search suffix: dot
+// separated labels, none empty, with no white space. A leading or a
+// trailing dot is let be.
+func validSuffix(s string) bool {
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "."), ".")
+	if s == "" || strings.ContainsAny(s, " \t/:@") {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // start sets the gate up, failing closed on anything it cannot have, and
@@ -355,6 +397,16 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		}
 		closers = append(closers, ln.Close)
 		onListen(src.name, "proxy", ln.Addr())
+		if src.proxy6 != "" {
+			ln6, err := net.Listen("tcp6", src.proxy6)
+			if err != nil {
+				return fmt.Errorf("source %s: %w", src.name, err)
+			}
+			closers = append(closers, ln6.Close)
+			onListen(src.name, "proxy6", ln6.Addr())
+			wg.Add(1)
+			go func() { defer wg.Done(); logIf(logger, g.Serve(ln6)) }()
+		}
 
 		dns := dnsgate.New(dnsgate.Config{
 			Source:   src.name,
@@ -362,7 +414,11 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			Resolver: net.DefaultResolver,
 			Fixed:    fixed,
 			Log:      log,
-			Logger:   logger.With("source", src.name),
+			// The search suffixes are the resolver's, the same for
+			// every source of one Pod.
+			SearchSuffixes: o.searchSuffixes,
+			IPv6:           src.proxy6 != "",
+			Logger:         logger.With("source", src.name),
 		})
 		pc, err := net.ListenPacket("udp", src.dns)
 		if err != nil {
@@ -376,6 +432,24 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		}
 		closers = append(closers, tl.Close)
 		onListen(src.name, "dns-tcp", tl.Addr())
+
+		if src.dns6 != "" {
+			pc6, err := net.ListenPacket("udp6", src.dns6)
+			if err != nil {
+				return fmt.Errorf("source %s: %w", src.name, err)
+			}
+			closers = append(closers, pc6.Close)
+			onListen(src.name, "dns6-udp", pc6.LocalAddr())
+			tl6, err := net.Listen("tcp6", src.dns6)
+			if err != nil {
+				return fmt.Errorf("source %s: %w", src.name, err)
+			}
+			closers = append(closers, tl6.Close)
+			onListen(src.name, "dns6-tcp", tl6.Addr())
+			wg.Add(2)
+			go func() { defer wg.Done(); logIf(logger, dns.ServeUDP(pc6)) }()
+			go func() { defer wg.Done(); logIf(logger, dns.ServeTCP(tl6)) }()
+		}
 
 		wg.Add(3)
 		go func() { defer wg.Done(); logIf(logger, g.Serve(ln)) }()

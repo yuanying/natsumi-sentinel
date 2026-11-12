@@ -37,7 +37,7 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `kind` | `http`・`connection`・`passthrough`・`dns`・`config`・`agent`・`answer`・`gate`（関所が自分で上流へ送った要求。Alertmanager への知らせと、GitHub のコネクタの問い合わせ） |
 | `treatment` | 振り分けの扱い（`open`・`passthrough`・`deny`） |
 | `name` | 宛先の名前（SNI と Host、または問い合わせた名前） |
-| `address` | 元の宛先（IP とポート） |
+| `address` | 元の宛先（IP とポート）。IPv4 は `192.0.2.10:443`、IPv6 は `[2001:db8::10]:443` の形 |
 | `method`・`path`・`query` | 要求の method・path・query |
 | `verdict` | `allow`・`ask`・`deny` |
 | `reason` | そう決めた理由。本人の答えでは、許した選択肢とその文、または断ったこと・取り消したこと |
@@ -50,13 +50,30 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `responseBytes` | 作業環境へ流した応答の本文の大きさ |
 | `bytesUp`・`bytesDown` | passthrough で送った量・受けた量 |
 | `durationNs` | 上流へ渡してから流し終えるまで、または接続の時間（ナノ秒） |
-| `dnsType`・`dnsRcode`・`dnsAnswer` | 問い合わせの型、答えの rcode、答えた IP の並び |
+| `dnsType`・`dnsRcode`・`dnsAnswer` | 問い合わせの型、答えの rcode、答えた IP の並び（AAAA では IPv6 のアドレス） |
 | `error` | 失敗の理由（上流へ渡せなかった、応答が途中で切れた、など） |
 | `authdReason` | authd が上流の応答を返さなかったときの理由の名前（[関所と authd の間の形](authd-protocol.md)）。断りか失敗かは `error` の文に出る |
 | `finished` | 書き終えたか |
 
 - `answer` の記録の `verdict` は、許した答えが `allow`、断った答えと取り消しが `deny` である。`name`・`operation`・`target`・`method`・`path` は、承認待ちの最初の中身か、取り消した許しのものを入れる。
 - `agent` の記録の `verdict` は `ask` で、`approval` に作った承認待ちの id が入る。
+
+## 名前解決の記録の理由
+
+名前解決の記録（`kind` が `dns`）の `reason` は、次のどれかである。断った問い合わせの理由は、どれも「not an open destination in the routing table」で始まる（分ける前の版の文で、それを探すものが引き続き見つけられるように）。
+
+| `reason` | `verdict` | いつ |
+|---|---|---|
+| `the gate's own name` | `allow` | 関所の固定の名前（`-gate-name`） |
+| `an open destination in the routing table` | `allow` | 振り分けで開く宛先の名前 |
+| `not an open destination in the routing table: the table denies the name` | `deny` | 振り分けで `treatment: deny` と書いた名前 |
+| `not an open destination in the routing table: a name in the table with a search suffix added` | `deny` | 振り分けにある名前に、`-dns-search-suffix` の接尾辞のどれかを付けた名前（下） |
+| `not an open destination in the routing table: the name is not in the table` | `deny` | 振り分けに無い名前（上に当たらないもの） |
+
+- 表で deny の名前と表に無い名前の断りは、知らせの組（`denied-name`）の取り方が同じである（[知らせ](notices.md)）。1 日のまとめの「断ったもの」は理由ごとに行を分けるので、別の行になる。
+- 作業環境の名前解決は、`ndots` の設定によって、名前をそのまま引く前に search の接尾辞を付けた名前（`api.example.com.<名前空間>.svc.cluster.local` など）を順に引く。関所に `-dns-search-suffix`（繰り返せる。例は `svc.cluster.local` の類）でその接尾辞を教えると、接尾辞を 1 つ除いた名前が振り分けにある（扱いは問わない）問い合わせに、この理由を付ける。答えは NXDOMAIN のままで、記録にも残るが、知らせの組にはしない。
+- 接尾辞は名前の区切り（`.`）で合うときだけ除く。接尾辞を除いた名前が振り分けに無い問い合わせは、表に無い名前として扱い、知らせの組にもなる。作業環境が接尾辞を付けた名前で何かを持ち出そうとしても、知らせから消えない。
+- `-dns-search-suffix` を渡さなければ、接尾辞を付けた名前も表に無い名前として扱う（前の版と同じ）。
 
 ## 要求の本文
 

@@ -263,7 +263,7 @@ func TestWithAnUpstreamItServesTheSourceAndRecordsUntilStopped(t *testing.T) {
 	done := make(chan int, 1)
 	var stdout, stderr syncBuffer
 	go func() {
-		done <- run(ctx, s.args("-gate-name", "sentinel.internal", "-gate-address", "192.0.2.53"), &stdout, &stderr)
+		done <- run(ctx, s.args("-gate-name", "sentinel.internal", "-gate-address", "192.0.2.53", "-dns-search-suffix", "svc.cluster.example"), &stdout, &stderr)
 	}()
 	select {
 	case <-l.ready:
@@ -355,4 +355,116 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+func TestASearchSuffixMustBeAName(t *testing.T) {
+	for _, suffix := range []string{"", ".", "with space.example", "a..example"} {
+		t.Run(suffix, func(t *testing.T) {
+			s := newSetup(t)
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), s.args("-dns-search-suffix", suffix), &stdout, &stderr); code != 2 {
+				t.Fatalf("run = %d, want 2; stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "-dns-search-suffix") {
+				t.Errorf("stderr %q does not name -dns-search-suffix", stderr.String())
+			}
+		})
+	}
+}
+
+func TestTheIPv6ListenersGoTogetherAndAreIPv6Addresses(t *testing.T) {
+	for _, src := range []string{
+		"name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0,proxy6=[::1]:0",
+		"name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0,dns6=[::1]:0",
+		"name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0,proxy6=127.0.0.1:0,dns6=[::1]:0",
+		"name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0,proxy6=[::1]:0,dns6=localhost:53",
+		"name=workspace,proxy=127.0.0.1:0,dns=127.0.0.1:0,proxy6=[::ffff:127.0.0.1]:0,dns6=[::1]:0",
+	} {
+		t.Run(src, func(t *testing.T) {
+			s := newSetup(t)
+			args := s.args()
+			args[len(args)-1] = src
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), args, &stdout, &stderr); code != 2 {
+				t.Fatalf("run = %d, want 2; stderr: %s", code, stderr.String())
+			}
+		})
+	}
+}
+
+func TestWithIPv6ListenersItAnswersNameResolutionOverIPv6(t *testing.T) {
+	if ln, err := net.Listen("tcp6", "[::1]:0"); err != nil {
+		t.Skipf("no IPv6 loopback here: %v", err)
+	} else {
+		_ = ln.Close()
+	}
+	withUpstream(t)
+	l := &listened{addrs: map[string]net.Addr{}, ready: make(chan struct{})}
+	old := onListen
+	onListen = func(source, what string, addr net.Addr) {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.addrs[source+"/"+what] = addr
+		if len(l.addrs) == 7 {
+			close(l.ready)
+		}
+	}
+	t.Cleanup(func() { onListen = old })
+
+	s := newSetup(t)
+	args := s.args("-gate-name", "sentinel.internal", "-gate-address", "192.0.2.53")
+	for i, a := range args {
+		if strings.HasPrefix(a, "name=workspace,") {
+			args[i] = a + ",proxy6=[::1]:0,dns6=[::1]:0"
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	var stdout, stderr syncBuffer
+	go func() { done <- run(ctx, args, &stdout, &stderr) }()
+	select {
+	case <-l.ready:
+	case code := <-done:
+		t.Fatalf("run returned %d before listening; stderr: %s", code, stderr.String())
+	case <-time.After(10 * time.Second):
+		t.Fatal("it did not listen")
+	}
+	l.mu.Lock()
+	for _, what := range []string{"proxy6", "dns6-udp", "dns6-tcp"} {
+		a := l.addrs["workspace/"+what]
+		if a == nil || !strings.HasPrefix(a.String(), "[::1]:") {
+			t.Errorf("%s listened on %v, want [::1]", what, a)
+		}
+	}
+	dnsAddr := l.addrs["workspace/dns6-udp"].String()
+	l.mu.Unlock()
+
+	c, err := net.Dial("udp6", dnsAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 7})
+	_ = b.StartQuestions()
+	_ = b.Question(dnsmessage.Question{Name: dnsmessage.MustNewName("sentinel.internal."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET})
+	q, _ := b.Finish()
+	if _, err := c.Write(q); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 512)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("no answer over IPv6: %v", err)
+	}
+	var m dnsmessage.Message
+	if err := m.Unpack(buf[:n]); err != nil || len(m.Answers) != 1 {
+		t.Fatalf("answer = %+v, %v", m, err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("it did not stop")
+	}
 }
