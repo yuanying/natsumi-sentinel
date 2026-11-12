@@ -85,6 +85,24 @@
 - 送るたびに、関所自身の要求として記録に残す（`kind` が `gate`）。記録が書けなければ送らない。
 - URL には、ユーザー・query・fragment を書けない。`https` でなければ使わない。
 
+### 認証の要る入口
+
+Alertmanager が、Bearer の token を確かめる入口（proxy など）の後ろにしか無いときは、`-alertmanager-surrogate` にサロゲートを与える。
+
+- 関所は、知らせの要求のすべてに `Authorization: Bearer <サロゲート>` を付ける。authd は、登録したとおりに、それを本物の鍵に差し替えて Alertmanager へ送る（ADR-0003）。関所は本物の鍵を持たず、読まない。
+- 付ける置き場所は `bearer`（scheme は `Bearer`）だけである。
+- サロゲートは秘密ではないので、フラグに平文で与えてよい（ADR-0003）。ただし、記録・ログ・指標・知らせの本文には出さない。出す理由が無いためである。
+- サロゲートに使えるのは、空白を含まない表示できる ASCII 文字だけである。それに合わなければ、URL が使えないときと同じに、知らせはログに出すだけになる。
+- 与えなければ、知らせの要求に `Authorization` は付かない。
+- `-alertmanager-url` 無しで与えても使わない。使わないことを標準エラーに出し、関所はそのまま動く（下の「Alertmanager を使わないとき」）。
+
+関所が自分で上流へ出す要求には、もう 1 つ、GitHub のコネクタの問い合わせ（ADR-0003「関所自身の問い合わせも authd を通す」、ADR-0005）がある。2 つはサロゲートの出どころが違う。
+
+| 要求 | 付けるサロゲート |
+|---|---|
+| コネクタの問い合わせ | 問い合わせのもとになった、作業環境の要求に付いていたサロゲート。要求を出した身元の権限を超えない |
+| 知らせ | `-alertmanager-surrogate` で環境が関所に与えたサロゲート。知らせは作業環境の要求から生まれるのではなく、関所が自分で出すためである |
+
 ### alert の形
 
 | 部分 | 中身 |
@@ -113,7 +131,7 @@
 ### Alertmanager を使わないとき
 
 - `-alertmanager-url` を与えなければ、知らせは関所の標準エラーのログに出すだけにする。関所はそのまま動く。
-- 知らせの設定（`-alertmanager-url`・`-alert-label`・`-summary-at`・`-summary-timezone`）が使えないときも、関所は起動する。使えないことを標準エラーに出し、URL が使えなければログに出すだけに、時刻や時間帯が使えなければ既定の値に倒す。知らせの設定は関所を止める理由にしない。`sentinel_notice_sender_configured` が 0 なら、知らせは Alertmanager へ届いていない。
+- 知らせの設定（`-alertmanager-url`・`-alertmanager-surrogate`・`-alert-label`・`-summary-at`・`-summary-timezone`）が使えないときも、関所は起動する。使えないことを標準エラーに出し、URL かサロゲートが使えなければログに出すだけに、時刻や時間帯が使えなければ既定の値に倒す。知らせの設定は関所を止める理由にしない。`sentinel_notice_sender_configured` が 0 なら、知らせは Alertmanager へ届いていない。
 - どちらの場合も、すべての知らせは送るかどうかによらず標準エラーに 1 行ずつ出る。
 
 ## 知らせに入れないもの
@@ -130,9 +148,9 @@
 |---|---|
 | Alertmanager の HTTPS の名前 | authd は HTTPS でしか送らず、上流の証明書をその名前で確かめる。クラスタの中の Alertmanager を、TLS を終端する名前（Service の前の TLS の終端、Ingress など）で届くようにする |
 | authd の登録 | `upstreams` に、その名前とポートを足す。証明書が自前の CA のものなら `ca_file` を書く |
-| 鍵 | Alertmanager の v2 の API に認証が無ければ、鍵の登録は要らない。前に認証を置くなら、サロゲートを置く口が関所の側に要る（この版には無い） |
+| 鍵 | Alertmanager の入口に認証が無ければ、鍵の登録は要らない。Bearer の token を確かめる入口の後ろなら、authd の `credentials` に 1 件足す。`surrogate` に関所へ与えるサロゲート、`key_file` に入口が受け付ける token のファイル、`upstreams` に Alertmanager の上流の名前、`places` に `bearer` を書く（[authd の登録の形式](authd-registration.md)） |
 | Alertmanager の route | `alertname` が `SentinelFirstSeen`・`SentinelAnswer`・`SentinelDailySummary` のものを、Slack の専用のチャンネルへ流す。1 件ずつ届くよう `group_by` に `pair` と `key`（答えは `answer`・`approval`・`grant`、まとめは `day`）を入れ、解消の知らせ（`send_resolved`）は切る |
-| 関所のフラグ | `-alertmanager-url`、インスタンスを示す `-alert-label`、本人の時間帯の `-summary-at` と `-summary-timezone` |
+| 関所のフラグ | `-alertmanager-url`、認証の要る入口なら `-alertmanager-surrogate`、インスタンスを示す `-alert-label`、本人の時間帯の `-summary-at` と `-summary-timezone` |
 | 指標の scrape と規則 | 関所と authd の `-metrics-listen` を scrape し、[指標](metrics.md) の「知らせの規則に使うもの」の規則を置く |
 
 関所自身の要求は、振り分け（[振り分けの形式](routes.md)）で決めない。Alertmanager の名前を振り分けに書く必要は無い。
