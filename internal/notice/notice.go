@@ -67,6 +67,9 @@ const (
 // record of something that was not let through is no pair, apart from a
 // name refused in name resolution.
 //
+// A request recorded as a read is no write, whatever its method: a git
+// fetch and a GraphQL query are POSTs the connector reads as reads.
+//
 // A write of a named operation is its name, operation and target, so that
 // one operation on one target is one pair whatever else is in its path. A
 // write of a raw operation is its name, method and path. The query is not
@@ -79,7 +82,7 @@ func Pairs(rec *audit.Record) []audit.Seen {
 	case rec.Kind == audit.KindHTTP && rec.Verdict == audit.Allow:
 		out := []audit.Seen{seen(PairDestination, rec.Name)}
 		switch {
-		case !isWrite(rec.Method):
+		case rec.Read || !isWrite(rec.Method):
 		case rec.Operation != "":
 			out = append(out, seen(PairOperation, strings.Join(nonEmpty(rec.Name, rec.Operation, rec.Target), " ")))
 		default:

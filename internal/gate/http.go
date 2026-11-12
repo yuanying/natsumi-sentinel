@@ -38,6 +38,7 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rec.Method = r.Method
 	rec.Path = r.URL.Path
 	rec.Query = r.URL.RawQuery
+	rec.Read = !isWrite(r.Method)
 
 	// Reads keep their fields only (docs/adr/0006): no text of the body.
 	var limit int64
@@ -99,6 +100,9 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	rec.Target = decision.Target
 	rec.Approval = decision.Approval
 	rec.Grant = decision.Grant
+	if decision.Read {
+		rec.Read = true
+	}
 	switch {
 	case decision.Error != "":
 		rec.Error = decision.Error

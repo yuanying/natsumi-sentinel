@@ -114,6 +114,10 @@ type Decision struct {
 	Fixed bool
 	// Request, when set, is what the record keeps of the body.
 	Request *audit.Body
+	// Read is a request the connector read as a read, whatever its
+	// method (a git fetch, a GraphQL query): it is recorded and counted
+	// as one.
+	Read bool
 	// Error is set when the decision could not be made as the table says
 	// (the ledger or a connector failed): the request is refused.
 	Error string
@@ -153,7 +157,7 @@ func (t Table) Decide(ctx context.Context, req Request) Decision {
 	case res.Refusal != "":
 		return Decision{Verdict: audit.Deny, Reason: "refused: " + res.Refusal, Fixed: true, Request: res.Request}
 	case res.Read:
-		return Decision{Verdict: audit.Allow, Reason: "a read: the connector lets reads through", Request: res.Request}
+		return Decision{Verdict: audit.Allow, Reason: "a read: the connector lets reads through", Request: res.Request, Read: true}
 	}
 	ops := res.Operations
 	if len(ops) == 0 {

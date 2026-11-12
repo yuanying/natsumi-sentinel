@@ -347,3 +347,62 @@ func TestMovingALogOfTheFirstVersionKeepsThePairsSeen(t *testing.T) {
 		t.Errorf("Write after the move: %v", err)
 	}
 }
+
+func TestThatARequestWasAReadIsKeptAndReadBack(t *testing.T) {
+	l, out, _ := openLog(t)
+	ctx := context.Background()
+	rec := &audit.Record{Time: at, Kind: audit.KindHTTP, Method: "POST", Path: "/o/r.git/git-upload-pack", Verdict: audit.Allow, Read: true}
+	if err := l.Begin(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Finish(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := l.Get(ctx, rec.ID)
+	if err != nil || !got.Read {
+		t.Fatalf("Get = %+v, %v; want a read", got, err)
+	}
+	if !strings.Contains(out.String(), `"read":true`) {
+		t.Errorf("stdout = %s, want the read", out.String())
+	}
+	recs, err := l.List(ctx, audit.Query{})
+	if err != nil || len(recs) != 1 || !recs[0].Read {
+		t.Errorf("List = %+v, %v", recs, err)
+	}
+}
+
+func TestMovingALogOfAnEarlierVersionMarksItsReadsByMethod(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(kind, method string) string {
+		return `INSERT INTO records (time, source, kind, treatment, name, address, method, path, query, verdict, reason,
+			status, response_bytes, bytes_up, bytes_down, duration_ns, dns_type, dns_rcode, dns_answer, error, finished)
+			VALUES ('2026-11-11T00:00:00.000000000Z', 'workspace', '` + kind + `', 'open', 'api.example.com', '', '` + method + `', '/', '', 'allow', '',
+			0, 0, 0, 0, 0, '', '', '[]', '', 1)`
+	}
+	for _, stmt := range []string{audit.SchemaV1ForTest, "PRAGMA user_version = 1",
+		insert("http", "GET"), insert("http", "POST"), insert("http", "HEAD"), insert("connection", "GET")} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	_ = db.Close()
+
+	l, err := audit.Open(path, io.Discard)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	for id, want := range map[int64]bool{1: true, 2: false, 3: true, 4: false} {
+		got, err := l.Get(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Read != want {
+			t.Errorf("record %d (%s %s): read = %v, want %v", id, got.Kind, got.Method, got.Read, want)
+		}
+	}
+}

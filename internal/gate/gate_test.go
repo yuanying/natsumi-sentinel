@@ -328,6 +328,9 @@ func TestAReadKeepsOnlyItsFields(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+	if !rec.Read {
+		t.Errorf("record = %+v, want a read", rec)
+	}
 	if rec.Request != nil && rec.Request.Text != "" {
 		t.Errorf("a read kept a body: %+v", rec.Request)
 	}

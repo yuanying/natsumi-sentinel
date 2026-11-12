@@ -29,6 +29,10 @@ func TestThePairsOfARecord(t *testing.T) {
 			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "POST", Path: "/repos/o/r/issues", Query: "x=1", Verdict: audit.Allow},
 			"[destination=api.example.com write=api.example.com POST /repos/o/r/issues]",
 		},
+		"a POST the connector read as a read is its destination": {
+			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "POST", Path: "/o/r.git/git-upload-pack", Verdict: audit.Allow, Read: true},
+			"[destination=api.example.com]",
+		},
 		"a write with an operation is its destination and the operation on its target": {
 			audit.Record{Kind: audit.KindHTTP, Name: "api.example.com", Method: "POST", Path: "/repos/o/r/issues/5/comments", Operation: "issues.comment", Target: "owner=o repo=r", Verdict: audit.Allow},
 			"[destination=api.example.com operation=api.example.com issues.comment owner=o repo=r]",
