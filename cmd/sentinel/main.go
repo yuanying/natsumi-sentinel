@@ -144,6 +144,7 @@ type options struct {
 // on as well as they can without it.
 type noticeOptions struct {
 	alertmanager    string
+	surrogate       string
 	labels          listFlag
 	summaryAt, zone string
 	queue           int
@@ -179,6 +180,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
 	fs.StringVar(&o.notices.alertmanager, "alertmanager-url", "", "Alertmanager's https base URL, reached through authd, to send the notices to; empty only logs them")
+	fs.StringVar(&o.notices.surrogate, "alertmanager-surrogate", "", "a surrogate put on the notices as Authorization: Bearer, for authd to swap for the key of an Alertmanager behind a door that wants one; empty puts none")
 	fs.Var(&o.notices.labels, "alert-label", "a label, name=value, put on every alert sent; repeat for each")
 	fs.StringVar(&o.notices.summaryAt, "summary-at", "00:00", "the time of day, HH:MM, of the daily summary, which covers the day up to it")
 	fs.StringVar(&o.notices.zone, "summary-timezone", "UTC", "the time zone of -summary-at, as an IANA name")
@@ -507,20 +509,25 @@ func setUpNotices(o noticeOptions, cfg notice.OutboxConfig, upstream http.RoundT
 	if o.alertmanager != "" {
 		am, err := notice.NewAlertmanager(notice.AlertmanagerConfig{
 			URL:       o.alertmanager,
+			Surrogate: o.surrogate,
 			Transport: upstream,
 			Log:       log,
 			Labels:    labels,
 			BodyLimit: bodyLimit,
 		})
 		if err != nil {
-			// The URL itself is not logged: it is not to carry a
-			// secret, but a mistaken one could.
-			logger.Error("-alertmanager-url cannot be used, so the notices are only logged", "error", err)
+			// Neither the URL nor the surrogate is logged: the URL is
+			// not to carry a secret, but a mistaken one could, and the
+			// surrogate has no need to be told.
+			logger.Error("-alertmanager-url or -alertmanager-surrogate cannot be used, so the notices are only logged", "error", err)
 		} else {
 			cfg.Sender = am
 		}
 	} else {
 		logger.Warn("no -alertmanager-url: the notices are only logged")
+		if o.surrogate != "" {
+			logger.Error("-alertmanager-surrogate is given without -alertmanager-url, so it is not used")
+		}
 	}
 	cfg.Max = o.queue
 
