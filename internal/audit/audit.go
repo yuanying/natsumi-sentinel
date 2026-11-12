@@ -32,9 +32,10 @@ type Kind string
 const (
 	// KindHTTP is one request read on an open destination.
 	KindHTTP Kind = "http"
-	// KindConnection is a connection refused before any request was read:
-	// a destination not opened, TLS without a name, plain HTTP, or
-	// something that is neither.
+	// KindConnection is a connection that ended before any request was
+	// read: one refused (a destination not opened, TLS without a name,
+	// plain HTTP, or something that is neither), or one to an open
+	// destination nothing was sent on (ReasonConnectionUnused).
 	KindConnection Kind = "connection"
 	// KindPassthrough is a connection let straight through.
 	KindPassthrough Kind = "passthrough"
@@ -77,6 +78,12 @@ const (
 	ReasonDNSSearchSuffix = "not an open destination in the routing table: a name in the table with a search suffix added"
 )
 
+// ReasonConnectionUnused is a TLS connection to an open destination that
+// closed before anything was sent on it: a tool that opened a connection
+// ahead of a request it then sent on another, or did not send at all. It
+// was not refused, so its verdict is allow (docs/audit.md).
+const ReasonConnectionUnused = "the connection was closed before anything was sent on it"
+
 // Body is what is kept of a request body: the text up to the limit, and the
 // size and hash of the whole. A body that is not text keeps only the size
 // and hash.
@@ -107,6 +114,11 @@ type Record struct {
 	Method string `json:"method,omitempty"`
 	Path   string `json:"path,omitempty"`
 	Query  string `json:"query,omitempty"`
+	// Read is a request that only reads: by its method (GET, HEAD,
+	// OPTIONS, TRACE), or as a connector read it whatever its method (a
+	// git fetch, a GraphQL query). It is false for a write and for the
+	// kinds that are not requests.
+	Read bool `json:"read,omitempty"`
 
 	Verdict Verdict `json:"verdict,omitempty"`
 	Reason  string  `json:"reason,omitempty"`
@@ -151,7 +163,7 @@ type Log struct {
 	out io.Writer
 }
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schemaV1 is the table as its first version had it. Each later version
 // adds to it with the statements in upgrades.
@@ -196,6 +208,9 @@ var upgrades = []string{
 	ALTER TABLE records ADD COLUMN grant_id TEXT NOT NULL DEFAULT '';
 	ALTER TABLE records ADD COLUMN authd_reason TEXT NOT NULL DEFAULT '';
 	CREATE INDEX records_source_verdict ON records (source, verdict, id);`,
+	// The requests recorded before are reads by their method alone.
+	`ALTER TABLE records ADD COLUMN read INTEGER NOT NULL DEFAULT 0;
+	UPDATE records SET read = 1 WHERE kind = 'http' AND method IN ('GET', 'HEAD', 'OPTIONS', 'TRACE');`,
 }
 
 // Open opens the SQLite file at path, creating it if it does not exist, and
@@ -310,14 +325,14 @@ func (l *Log) insert(ctx context.Context, rec *Record) error {
 		request_text, request_size, request_sha256, request_truncated, request_binary,
 		status, response_bytes, bytes_up, bytes_down, duration_ns,
 		dns_type, dns_rcode, dns_answer, error, finished,
-		operation, target, approval, grant_id, authd_reason
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		operation, target, approval, grant_id, authd_reason, read
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		formatTime(rec.Time), rec.Source, string(rec.Kind), rec.Treatment, rec.Name, rec.Address,
 		rec.Method, rec.Path, rec.Query, string(rec.Verdict), rec.Reason,
 		text, size, hash, trunc, bin,
 		rec.Status, rec.ResponseBytes, rec.BytesUp, rec.BytesDown, int64(rec.Duration),
 		rec.DNSType, rec.DNSRcode, string(answer), rec.Error, rec.Finished,
-		rec.Operation, rec.Target, rec.Approval, rec.Grant, rec.AuthdReason)
+		rec.Operation, rec.Target, rec.Approval, rec.Grant, rec.AuthdReason, rec.Read)
 	if err != nil {
 		return fmt.Errorf("write audit record: %w", err)
 	}
@@ -360,7 +375,7 @@ const columns = `id, time, source, kind, treatment, name, address, method, path,
 	request_text, request_size, request_sha256, request_truncated, request_binary,
 	status, response_bytes, bytes_up, bytes_down, duration_ns,
 	dns_type, dns_rcode, dns_answer, error, finished,
-	operation, target, approval, grant_id, authd_reason`
+	operation, target, approval, grant_id, authd_reason, read`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -378,7 +393,7 @@ func scanRecord(row scanner) (*Record, error) {
 		&text, &size, &hash, &trunc, &bin,
 		&rec.Status, &rec.ResponseBytes, &rec.BytesUp, &rec.BytesDown, &duration,
 		&rec.DNSType, &rec.DNSRcode, &answer, &rec.Error, &rec.Finished,
-		&rec.Operation, &rec.Target, &rec.Approval, &rec.Grant, &rec.AuthdReason)
+		&rec.Operation, &rec.Target, &rec.Approval, &rec.Grant, &rec.AuthdReason, &rec.Read)
 	if err != nil {
 		return nil, err
 	}

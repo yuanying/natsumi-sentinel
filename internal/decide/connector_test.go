@@ -22,8 +22,8 @@ func TestARequestTheConnectorReadsAsAReadGoesThroughWithoutTheTable(t *testing.T
 	tbl := result(decide.Result{Read: true})
 	tbl.Ledger = l
 	got := tbl.Decide(context.Background(), ghRequest(t, "deny.example.com", "POST", "/graphql", `{"query":"{viewer{login}}"}`))
-	if got.Verdict != audit.Allow || !strings.Contains(got.Reason, "read") {
-		t.Errorf("Decide = %+v", got)
+	if got.Verdict != audit.Allow || !strings.Contains(got.Reason, "read") || !got.Read {
+		t.Errorf("Decide = %+v, want a read let through", got)
 	}
 	if len(l.looked)+len(l.held) != 0 {
 		t.Error("the ledger was asked about a read")
@@ -34,6 +34,13 @@ func TestARequestTheConnectorRefusesIsDeniedWithItsReasonAndNoTableCanChangeIt(t
 	got := result(decide.Result{Refusal: "a document with two mutations"}).Decide(context.Background(), ghRequest(t, "allow.example.com", "POST", "/graphql", `{}`))
 	if got.Verdict != audit.Deny || !got.Fixed || !strings.Contains(got.Reason, "two mutations") || got.Error != "" {
 		t.Errorf("Decide = %+v", got)
+	}
+}
+
+func TestARequestTheConnectorNamesAsAnOperationIsNotARead(t *testing.T) {
+	got := result(decide.Result{Operations: []decide.Operation{{Name: "read"}}}).Decide(context.Background(), ghRequest(t, "allow.example.com", "POST", "/graphql", `{}`))
+	if got.Verdict != audit.Allow || got.Read {
+		t.Errorf("Decide = %+v, want an operation let through, not a read", got)
 	}
 }
 

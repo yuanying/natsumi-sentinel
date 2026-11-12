@@ -328,6 +328,9 @@ func TestAReadKeepsOnlyItsFields(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+	if !rec.Read {
+		t.Errorf("record = %+v, want a read", rec)
+	}
 	if rec.Request != nil && rec.Request.Text != "" {
 		t.Errorf("a read kept a body: %+v", rec.Request)
 	}
@@ -868,4 +871,16 @@ func TestAPassthroughThatCannotBeRecordedIsNotConnected(t *testing.T) {
 	if n, err := conn.Read(make([]byte, 5)); err == nil {
 		t.Errorf("read %d bytes through a passthrough that was not recorded", n)
 	}
+}
+
+// has reports whether a finished record satisfies ok now.
+func (m *memLog) has(ok func(*audit.Record) bool) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.records {
+		if r.Finished && ok(r) {
+			return true
+		}
+	}
+	return false
 }

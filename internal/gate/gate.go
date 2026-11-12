@@ -322,14 +322,32 @@ type openConn struct {
 
 	mu     sync.Mutex
 	served bool
-	at     time.Time
+	// sent is whether anything came on the connection after the
+	// handshake.
+	sent bool
+	at   time.Time
+}
+
+// Read notes that something came, so that a connection closed before
+// anything did is told apart from one whose bytes were not a request.
+func (oc *openConn) Read(b []byte) (int, error) {
+	n, err := oc.Conn.Read(b)
+	if n > 0 {
+		oc.mu.Lock()
+		oc.sent = true
+		oc.mu.Unlock()
+	}
+	return n, err
 }
 
 type connKey struct{}
 
 // connState records a TLS connection that closed without a single request
-// reaching the gate: the HTTP server refused what came (a request without
-// Host, or one it could not read).
+// reaching the gate. When nothing came at all, the tool opened it and did
+// not use it (HTTP clients dial ahead and keep what they do not need idle):
+// nothing was refused, and it is recorded as allowed. When something came,
+// the HTTP server refused it (a request without Host, or one it could not
+// read).
 func (g *Gate) connState(c net.Conn, state http.ConnState) {
 	oc, ok := c.(*openConn)
 	if !ok {
@@ -342,7 +360,7 @@ func (g *Gate) connState(c net.Conn, state http.ConnState) {
 		oc.mu.Unlock()
 	case http.StateClosed:
 		oc.mu.Lock()
-		served := oc.served
+		served, sent := oc.served, oc.sent
 		oc.mu.Unlock()
 		if served {
 			return
@@ -350,6 +368,14 @@ func (g *Gate) connState(c net.Conn, state http.ConnState) {
 		rec := g.base(audit.KindConnection, oc.dst)
 		rec.Name = oc.sni
 		rec.Treatment = string(routes.Open)
+		if !sent {
+			rec.Verdict = audit.Allow
+			rec.Reason = audit.ReasonConnectionUnused
+			if err := g.cfg.Log.Write(context.Background(), rec); err != nil {
+				g.cfg.Logger.Error("an unused connection could not be recorded", "error", err)
+			}
+			return
+		}
 		g.refuseConn(rec, "no request was read on the connection (no Host, or not HTTP/1.1)")
 	}
 }

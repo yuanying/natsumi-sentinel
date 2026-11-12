@@ -52,7 +52,7 @@
 | `kind` | 記録の `kind`。`http`・`connection`・`passthrough`・`dns`・`gate`。振り分けの読み直し（`config`）は数えない |
 | `treatment` | 記録の `treatment`。`open`・`passthrough`・`deny`、当てはまらなければ空 |
 | `destination` | 上の「label の決まり」のとおり |
-| `verdict` | 記録の `verdict`。どう決めたか。`allow`・`ask`・`deny`。許しに当たって通ったものは `allow` |
+| `verdict` | 記録の `verdict`。どう決めたか。`allow`・`ask`・`deny`。許しに当たって通ったものは `allow`。開く宛先へ張られたまま何も送られずに閉じた接続は `kind` が `connection` で `allow` である（[関所の記録](audit.md) の「接続の記録」） |
 
 - 数えるのは、記録を書き終えたときである。上流へ渡す前に書く記録（[関所の記録](audit.md)の「書く時」）は、答えを流し終えて書き足したときに 1 つ数える。
 - 記録を書けずに通さなかったものは数えない（それは `sentinel_audit_write_failures_total` に出る）。

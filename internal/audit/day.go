@@ -77,7 +77,7 @@ func (l *Log) Day(ctx context.Context, from, to time.Time) (*Day, error) {
 		return nil
 	}, `SELECT name, operation, CASE WHEN operation = '' THEN method ELSE '' END AS m, count(*) AS n FROM records
 		WHERE time >= ? AND time < ? AND kind = ? AND verdict = ?
-			AND method NOT IN ('GET', 'HEAD', 'OPTIONS', 'TRACE')
+			AND method NOT IN ('GET', 'HEAD', 'OPTIONS', 'TRACE') AND read = 0
 		GROUP BY name, operation, m ORDER BY n DESC, name, operation, m`, f, t, string(KindHTTP), string(Allow))
 	if err != nil {
 		return nil, err

@@ -63,3 +63,30 @@ func TestWhatTheDecisionKeepsOfTheBodyIsRecordedInPlaceOfTheBodyWithItsSizeAndHa
 		t.Errorf("a denied push's body = %+v", rec.Request)
 	}
 }
+
+func TestARequestTheDecisionCallsAReadIsRecordedAsARead(t *testing.T) {
+	e := newEnv(t, 1)
+	e.setDecision(decide.Decision{Verdict: audit.Allow, Reason: "a read: the connector lets reads through", Read: true})
+	resp, err := e.client().Post("https://api.example.com/o/r.git/git-upload-pack", "application/x-git-upload-pack-request", strings.NewReader("0000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+	if rec.Method != "POST" || !rec.Read || rec.Verdict != audit.Allow {
+		t.Errorf("record = %+v, want a POST recorded as a read", rec)
+	}
+}
+
+func TestAWriteIsNotRecordedAsARead(t *testing.T) {
+	e := newEnv(t, 1)
+	resp, err := e.client().Post("https://api.example.com/repos/o/r/issues", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	rec := e.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindHTTP })
+	if rec.Read {
+		t.Errorf("record = %+v, want a write", rec)
+	}
+}
