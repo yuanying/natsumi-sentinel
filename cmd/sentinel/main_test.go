@@ -199,6 +199,14 @@ func TestItDoesNotStartWithoutWhatItNeeds(t *testing.T) {
 			s.approvals = filepath.Join(t.TempDir(), "missing", "approvals.sock")
 			return s.args()
 		},
+		"authd's registration that cannot be read": func(s *setup) []string {
+			return s.args("-authd-registration", filepath.Join(t.TempDir(), "missing.yaml"))
+		},
+		"authd's registration with a credential without a surrogate": func(s *setup) []string {
+			path := filepath.Join(t.TempDir(), "registration.yaml")
+			_ = os.WriteFile(path, []byte("credentials:\n  - key_file: /k\n"), 0o600)
+			return s.args("-authd-registration", path)
+		},
 	}
 	for name, mk := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -260,10 +268,15 @@ func TestWithAnUpstreamItServesTheSourceAndRecordsUntilStopped(t *testing.T) {
 
 	s := newSetup(t)
 	ctx, cancel := context.WithCancel(context.Background())
+	registration := filepath.Join(t.TempDir(), "registration.yaml")
+	if err := os.WriteFile(registration, []byte("credentials:\n  - surrogate: surrogate-0123456789abcdef\n    key_file: /never/read\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan int, 1)
 	var stdout, stderr syncBuffer
 	go func() {
-		done <- run(ctx, s.args("-gate-name", "sentinel.internal", "-gate-address", "192.0.2.53", "-dns-search-suffix", "svc.cluster.example"), &stdout, &stderr)
+		done <- run(ctx, s.args("-gate-name", "sentinel.internal", "-gate-address", "192.0.2.53", "-dns-search-suffix", "svc.cluster.example",
+			"-inside-domain", "inside.example", "-authd-registration", registration), &stdout, &stderr)
 	}()
 	select {
 	case <-l.ready:
@@ -367,6 +380,21 @@ func TestASearchSuffixMustBeAName(t *testing.T) {
 			}
 			if !strings.Contains(stderr.String(), "-dns-search-suffix") {
 				t.Errorf("stderr %q does not name -dns-search-suffix", stderr.String())
+			}
+		})
+	}
+}
+
+func TestAnInsideDomainMustBeAName(t *testing.T) {
+	for _, domain := range []string{"", "a..b", "192.0.2.1", "example.com:443"} {
+		t.Run(domain, func(t *testing.T) {
+			s := newSetup(t)
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), s.args("-inside-domain", domain), &stdout, &stderr); code != 2 {
+				t.Fatalf("run = %d, want 2; stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "-inside-domain") {
+				t.Errorf("stderr %q does not name -inside-domain", stderr.String())
 			}
 		})
 	}
