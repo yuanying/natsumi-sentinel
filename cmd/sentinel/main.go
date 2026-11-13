@@ -140,6 +140,10 @@ type options struct {
 	// (docs/destination-grants.md "関所が直に送る").
 	insideDomains     listFlag
 	authdRegistration string
+	// destinationGrants turns the destination grants on
+	// (docs/destination-grants.md). Off, the gate is as it was before
+	// them.
+	destinationGrants bool
 	reload            time.Duration
 	metrics           string
 	notices           noticeOptions
@@ -185,6 +189,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.Var(&o.searchSuffixes, "dns-search-suffix", "a search suffix of the workspace's resolver, such as svc.cluster.local; a refused name in the table with it added is recorded but not noticed; repeat for each")
 	fs.Var(&o.insideDomains, "inside-domain", "an inside domain: the names under it may be connected to private addresses when the gate sends upstream itself; repeat for each")
 	fs.StringVar(&o.authdRegistration, "authd-registration", "", "authd's registration, read for its surrogates only, so that the gate refuses to send one it does not swap; the keys it names are not read")
+	fs.BoolVar(&o.destinationGrants, "destination-grants", false, "give destination grants: names not in the routing table the owner allows, sent upstream by the gate itself on port 443; needs -authd-registration, and the gate's UID let out to port 443")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
 	fs.StringVar(&o.notices.alertmanager, "alertmanager-url", "", "Alertmanager's https base URL, reached through authd, to send the notices to; empty only logs them")
@@ -258,6 +263,11 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 	if _, err := direct.ParseDomains(o.insideDomains); err != nil {
 		return nil, fmt.Errorf("-inside-domain: %w", err)
 	}
+	if o.destinationGrants && o.authdRegistration == "" {
+		// Without the surrogates, one would go out unswapped to a
+		// granted destination.
+		return nil, errors.New("-destination-grants needs -authd-registration")
+	}
 	if (o.gateName == "") != (o.gateAddress == "") {
 		return nil, errors.New("-gate-name and -gate-address go together")
 	}
@@ -308,16 +318,21 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		return err
 	}
 	defer func() { _ = book.Close() }()
-	// The gate's own sending is not used yet: what it is given is read
-	// here, so that a setting it cannot use stops the gate now as it
-	// will then.
+	// The gate's own sending is read even when the destination grants
+	// are off, so that a setting it cannot use stops the gate whether or
+	// not they are on.
 	var surrogates direct.Surrogates
 	if o.authdRegistration != "" {
 		if surrogates, err = direct.LoadSurrogates(o.authdRegistration); err != nil {
 			return err
 		}
 	}
-	logger.Info("the gate's own sending is set up, and not used yet", "insideDomains", len(o.insideDomains), "surrogates", surrogates.Len())
+	inside, _ := direct.ParseDomains(o.insideDomains)
+	if o.destinationGrants {
+		logger.Info("destination grants are on: the gate sends what they let through itself", "insideDomains", len(o.insideDomains), "surrogates", surrogates.Len())
+	} else {
+		logger.Info("destination grants are off", "insideDomains", len(o.insideDomains), "surrogates", surrogates.Len())
+	}
 	upstream := newUpstream(o.authdSocket)
 
 	reg := metrics.NewRegistry(program, version)
@@ -335,11 +350,25 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	// The GitHub connector asks its questions through authd too, and
 	// records them as the gate's own (docs/adr/0005).
 	decider := decide.Table{Ledger: book, GitHub: &github.Connector{Transport: upstream, Log: log, Logger: logger.With("part", "github")}}
+	var (
+		sender      gate.DirectSender
+		doorGrants  *approvals.DestinationConfig
+		destMetrics *observe.DestinationMetrics
+	)
+	if o.destinationGrants {
+		decider.Destinations = &decide.DestinationGrants{Ledger: book, Fixed: fixedNames, SearchSuffixes: o.searchSuffixes, Inside: inside}
+		sender = gm.Direct(direct.New(direct.Config{Inside: inside, Surrogates: surrogates}))
+		doorGrants = &approvals.DestinationConfig{Routes: watcher.Current, Fixed: fixedNames, SearchSuffixes: o.searchSuffixes, Inside: inside}
+		destMetrics = observe.NewDestinationMetrics(reg, book.CountDestinationGrants, book.CountRefused, logger)
+	}
 	outbox, summary := setUpNotices(o.notices, notice.OutboxConfig{
 		Logger:     logger.With("part", "notices"),
 		Registerer: reg,
 	}, upstream, log, db, func() int64 { return watcher.Current().Audit().BodyLimit })
 	pairs = notice.NewWatcher(notice.WatcherConfig{Log: db, Outbox: outbox, Logger: logger, Registerer: reg})
+	if doorGrants != nil {
+		doorGrants.Granted = func(g *ledger.Grant) { outbox.Put(notice.GrantedFromList(g, g.Created)) }
+	}
 	// The doors write through log too, so the answers are counted and
 	// watched like every other record, and read straight from db.
 	records := approvalRecords{Log: log, db: db}
@@ -363,8 +392,9 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 	owner := &http.Server{
 		Handler: approvals.Owner(approvals.OwnerConfig{
 			Ledger: book, Log: records,
-			Answered: func(a *ledger.Approval) { outbox.Put(notice.Answered(a)) },
-			Revoked:  func(g *ledger.Grant, at time.Time) { outbox.Put(notice.Revoked(g, at)) },
+			Answered:     func(a *ledger.Approval) { outbox.Put(notice.Answered(a)) },
+			Revoked:      func(g *ledger.Grant, at time.Time) { outbox.Put(notice.Revoked(g, at)) },
+			Destinations: doorGrants,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
@@ -405,13 +435,14 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			Minter:      minter,
 			Log:         log,
 			Upstream:    gm.Upstream(upstream),
+			Direct:      sender,
 			OriginalDst: origdst.Lookup,
 			Logger:      logger.With("source", src.name),
 		}
 		for name, addr := range fixed {
 			cfg.AgentAddr = netip.AddrPortFrom(addr, 80)
 			cfg.StatusURL = "http://" + name + "/v1/status"
-			cfg.Agent = approvals.Agent(approvals.AgentConfig{Source: src.name, Ledger: book, Log: records, Routes: watcher.Current})
+			cfg.Agent = approvals.Agent(approvals.AgentConfig{Source: src.name, Ledger: book, Log: records, Routes: watcher.Current, Destinations: doorGrants})
 		}
 		g := gate.New(cfg)
 		closers = append(closers, g.Close)
@@ -432,7 +463,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			go func() { defer wg.Done(); logIf(logger, g.Serve(ln6)) }()
 		}
 
-		dns := dnsgate.New(dnsgate.Config{
+		dcfg := dnsgate.Config{
 			Source:   src.name,
 			Routes:   watcher.Current,
 			Names:    decider,
@@ -444,7 +475,12 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			SearchSuffixes: o.searchSuffixes,
 			IPv6:           src.proxy6 != "",
 			Logger:         logger.With("source", src.name),
-		})
+		}
+		if o.destinationGrants {
+			dcfg.Refused = book
+			dcfg.Remembered = destMetrics.Remembered
+		}
+		dns := dnsgate.New(dcfg)
 		pc, err := net.ListenPacket("udp", src.dns)
 		if err != nil {
 			return fmt.Errorf("source %s: %w", src.name, err)

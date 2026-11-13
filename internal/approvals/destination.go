@@ -208,10 +208,6 @@ type refusedRecent struct {
 	Count int64     `json:"count"`
 }
 
-// errNotGrantable is a destination that cannot be asked for: what the
-// owner's approval could not let through, or what needs no approval.
-var errNotGrantable = errors.New("not grantable")
-
 // askDestinations makes an approval of the names the workspace asked for.
 func (a *agent) askDestinations(w http.ResponseWriter, r *http.Request, items []askItem) {
 	dc := a.cfg.Destinations
