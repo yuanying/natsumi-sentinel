@@ -6,7 +6,7 @@
 
 - 正本は `-db` で渡す SQLite のファイルである。ファイルのあるディレクトリが無ければ関所は起動しない（volume の mount 忘れを、空のディレクトリを作って隠さない）。
 - 同じ記録を、1 件ごとに 1 行の JSON で標準出力にも出す。これは写しで、書けなくても要求は止めない。関所自身のログは標準エラーに出し、標準出力には記録だけが出る。
-- 記録の表は `records` の 1 つで、SQLite の `user_version` で形の版を持つ。いまの版は 3 である。版 1・2 のファイルは、起動のときに版 3 へ移す（欄を足すだけで、ある記録はそのまま残る。版 3 で足した `read` は、移す前の `http` の記録のうち method が GET・HEAD・OPTIONS・TRACE のものを真にする）。関所より新しい版のファイルは開かず、起動しない。
+- 記録の表は `records` の 1 つで、SQLite の `user_version` で形の版を持つ。いまの版は 4 である。版 1〜3 のファイルは、起動のときに版 4 へ移す（欄を足すだけで、ある記録はそのまま残る。版 3 で足した `read` は、移す前の `http` の記録のうち method が GET・HEAD・OPTIONS・TRACE のものを真にする。版 4 で足した `upstreamAddress` は、移す前の記録では空である）。関所より新しい版のファイルは開かず、起動しない。
 - 同じファイルに、「初めて見る」の覚えの表 `seen` を記録と別に持つ（[知らせ](notices.md)）。組の種類（`pair`）・中身（`key`）・初めて見た記録の時刻（`first_time`）と番号（`first_record`）の 4 つの列で、組の種類と中身で 1 行である。`records` の形の版とは別に、無ければ起動のときに作る。古い記録を消すときにも消さない。
 
 ## 書く時と、書けないとき
@@ -54,6 +54,7 @@ JSON の名前で書く。SQLite の列は同じ意味の snake_case である�
 | `dnsType`・`dnsRcode`・`dnsAnswer` | 問い合わせの型、答えの rcode、答えた IP の並び（AAAA では IPv6 のアドレス） |
 | `error` | 失敗の理由（上流へ渡せなかった、応答が途中で切れた、など） |
 | `authdReason` | authd が上流の応答を返さなかったときの理由の名前（[関所と authd の間の形](authd-protocol.md)）。断りか失敗かは `error` の文に出る |
+| `upstreamAddress` | 関所が自分で上流へつないだアドレスの並び（`IP:ポート`）。引いたアドレスでつながずに断ったときは、引いたアドレスのすべて。authd が送るものでは空（[宛先の許し](destination-grants.md) の「記録に足すもの」）。SQLite の列は `upstream_address` で、空白で区切る |
 | `finished` | 書き終えたか |
 
 - `answer` の記録の `verdict` は、許した答えが `allow`、断った答えと取り消しが `deny` である。`name`・`operation`・`target`・`method`・`path` は、承認待ちの最初の中身か、取り消した許しのものを入れる。
