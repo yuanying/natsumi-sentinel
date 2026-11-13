@@ -119,7 +119,7 @@ func (t Table) DecideName(ctx context.Context, q NameQuery) NameAnswer {
 		return NameAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: audit.ReasonDNSNotListed + "; " + reasonNoLedger, Error: err.Error()}
 	}
 	if g != nil {
-		return NameAnswer{Verdict: audit.Allow, Treatment: grantTreatment(g), Grant: g.ID, Reason: ReasonDNSGranted + ": " + g.ID}
+		return NameAnswer{Verdict: audit.Allow, Treatment: grantTreatment(g), Grant: g.ID, Reason: ReasonDNSGranted + ": " + g.ID + t.insideMark(name)}
 	}
 	// 4.
 	if j, ok := t.judge(ctx, Question{Point: PointName, Source: q.Source, Name: name}); ok {
@@ -220,10 +220,10 @@ func (t Table) DecideConnection(ctx context.Context, q ConnectionQuery) Connecti
 			return ConnectionAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: fmt.Sprintf("not in the routing table on this port; the destination grant %s covers port %d only", g.ID, GrantPort)}
 		case g != nil && g.Handling == ledger.Passthrough:
 			return ConnectionAnswer{Verdict: audit.Allow, Passthrough: true, Treatment: "passthrough", Grant: g,
-				Reason: fmt.Sprintf("the destination grant %s passes the name through unopened: reads and writes both go through, and what is in them is not seen", g.ID)}
+				Reason: fmt.Sprintf("the destination grant %s passes the name through unopened: reads and writes both go through, and what is in them is not seen", g.ID) + t.insideMark(name)}
 		case g != nil:
 			return ConnectionAnswer{Verdict: audit.Allow, Treatment: routes.Open, Destination: GrantedDestination(name), Grant: g,
-				Reason: fmt.Sprintf("the destination grant %s opens the name", g.ID)}
+				Reason: fmt.Sprintf("the destination grant %s opens the name", g.ID) + t.insideMark(name)}
 		}
 	}
 	// 4. A judge cannot open a connection yet: an opened connection is

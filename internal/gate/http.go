@@ -16,6 +16,7 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
+	"github.com/yuanying/natsumi-sentinel/internal/upstream"
 )
 
 const tableHint = "This is set in the gate's routing table; to change it, the owner edits the table."
@@ -80,6 +81,8 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		Body:         capture.Prefix(),
 		BodyComplete: !prefix.Truncated,
 		BodySummary:  summary(capture),
+		Granted:      oc.granted,
+		Routes:       table,
 	})
 	rec.Reason = decision.Reason
 	kept := func() *audit.Body { return summary(capture) }
@@ -137,11 +140,33 @@ func (g *Gate) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	out := outgoing(r, oc, body)
-	resp, err := g.cfg.Upstream.RoundTrip(out)
-	if err != nil {
-		text := upstreamFailure(rec, err)
-		writeGate(w, http.StatusBadGateway, MarkError, text)
-		return
+	var (
+		resp *http.Response
+	)
+	if oc.granted {
+		// What a destination grant lets through is sent by the gate
+		// itself, never by authd (docs/adr/0007).
+		if g.cfg.Direct == nil {
+			rec.Error = "the gate has no sending of its own"
+			writeGate(w, http.StatusServiceUnavailable, MarkError, "the request was not sent: the gate cannot send it itself")
+			return
+		}
+		ctx, rep := upstream.WithReport(out.Context())
+		resp, err = g.cfg.Direct.RoundTrip(out.WithContext(ctx))
+		reported(rec, *rep, err)
+		if err != nil {
+			status, mark, text := directFailure(rec, err)
+			rec.Status = status
+			writeGate(w, status, mark, text)
+			return
+		}
+	} else {
+		resp, err = g.cfg.Upstream.RoundTrip(out)
+		if err != nil {
+			text := upstreamFailure(rec, err)
+			writeGate(w, http.StatusBadGateway, MarkError, text)
+			return
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 

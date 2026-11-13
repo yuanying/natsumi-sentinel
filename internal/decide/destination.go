@@ -30,6 +30,21 @@ type DestinationGrants struct {
 	// workspace's resolver: neither is granted.
 	Fixed          []string
 	SearchSuffixes []string
+	// Inside are the inside domains: what is decided for a name under one
+	// says so in its reason (docs/adr/0008 "記録と知らせ").
+	Inside upstream.Domains
+}
+
+// MarkInside is put at the end of the reason of what a destination grant
+// decides for an inside name.
+const MarkInside = "; an inside name"
+
+// insideMark is MarkInside for an inside name, and empty for any other.
+func (t Table) insideMark(name string) string {
+	if t.Destinations != nil && t.Destinations.Inside.Inside(name) {
+		return MarkInside
+	}
+	return ""
 }
 
 // GrantPort is the only port a destination grant covers (docs/adr/0008
@@ -125,10 +140,10 @@ func (t Table) decideGranted(ctx context.Context, req Request) Decision {
 		return Decision{Verdict: audit.Deny, Fixed: true, Reason: "no destination grant opens the name any more; the grant the connection was opened by has ended"}
 	}
 	if g.Access == ledger.ReadWrite {
-		return Decision{Verdict: audit.Allow, Grant: g.ID, Reason: fmt.Sprintf("the destination grant %s opens the name for reads and writes", g.ID)}
+		return Decision{Verdict: audit.Allow, Grant: g.ID, Reason: fmt.Sprintf("the destination grant %s opens the name for reads and writes", g.ID) + t.insideMark(name)}
 	}
 	if !isWrite(req.Method) {
-		return Decision{Verdict: audit.Allow, Grant: g.ID, Reason: fmt.Sprintf("a read: the destination grant %s opens the name for reads", g.ID)}
+		return Decision{Verdict: audit.Allow, Grant: g.ID, Reason: fmt.Sprintf("a read: the destination grant %s opens the name for reads", g.ID) + t.insideMark(name)}
 	}
 	// A write is a raw operation on a destination that asks
 	// (docs/adr/0008 "読みだけか、読み書きか").
@@ -136,7 +151,7 @@ func (t Table) decideGranted(ctx context.Context, req Request) Decision {
 	d.Default = routes.Ask
 	req.Destination = d
 	dec := t.decide(ctx, req, []Operation{{}})
-	dec.Reason = fmt.Sprintf("a write, and the destination grant %s opens the name for reads only: %s", g.ID, dec.Reason)
+	dec.Reason = fmt.Sprintf("a write, and the destination grant %s opens the name for reads only: %s", g.ID, dec.Reason) + t.insideMark(name)
 	return dec
 }
 

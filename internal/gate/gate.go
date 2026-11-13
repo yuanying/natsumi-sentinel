@@ -53,6 +53,10 @@ type Config struct {
 	Minter      *certs.Minter
 	Log         Recorder
 	Upstream    http.RoundTripper
+	// Direct is the gate's own sending (internal/upstream), for what a
+	// destination grant lets through: it never goes to authd
+	// (docs/adr/0007, 0008). Nil, and nothing a grant covers is sent.
+	Direct DirectSender
 	// OriginalDst finds where a connection was going.
 	OriginalDst func(net.Conn) (netip.AddrPort, error)
 	// Dial connects a passthrough. Defaults to a net.Dialer.
@@ -300,6 +304,7 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 			g.refuseConn(rec, "TLS without SNI; the gate decides by name")
 		case errors.Is(err, errNotOpened):
 			rec.Treatment = string(ans.Treatment)
+			rec.Error = ans.Error
 			g.refuseConn(rec, ans.Reason)
 		default:
 			rec.Treatment = string(routes.Open)
@@ -310,7 +315,7 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 		return
 	}
 	_ = pc.SetDeadline(time.Time{})
-	if err := g.tlsc.push(&openConn{Conn: tc, sni: sni, dst: dst, dest: ans.Destination}); err != nil {
+	if err := g.tlsc.push(&openConn{Conn: tc, sni: sni, dst: dst, dest: ans.Destination, granted: ans.Grant != nil}); err != nil {
 		_ = tc.Close()
 	}
 }
@@ -322,6 +327,9 @@ type openConn struct {
 	sni  string
 	dst  netip.AddrPort
 	dest routes.Destination
+	// granted is a connection a destination grant opened: its requests
+	// are decided by the grant and sent by the gate itself.
+	granted bool
 
 	mu     sync.Mutex
 	served bool
