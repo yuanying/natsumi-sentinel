@@ -2,6 +2,7 @@ package gate_test
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
@@ -313,5 +314,69 @@ func TestANameWithoutAGrantDoesNotGetPastTLS(t *testing.T) {
 	rec := ge.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindConnection })
 	if rec.Verdict != audit.Deny || rec.Name != "example.com" {
 		t.Errorf("record = %+v", rec)
+	}
+}
+
+// passClient talks TLS to the upstream itself, through the gate.
+func (ge *grantEnv) passClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, ge.addr)
+			},
+			TLSClientConfig:   &tls.Config{RootCAs: ge.upRoots},
+			DisableKeepAlives: true,
+		},
+		Timeout: 10 * time.Second,
+	}
+}
+
+func passGrant() *ledger.Grant {
+	return &ledger.Grant{ID: "gr-pass", Kind: ledger.GrantDestination, Source: "workspace", Name: "example.com", Unit: ledger.UnitName, Handling: ledger.Passthrough}
+}
+
+func TestAPassthroughGrantConnectsTheWorkspacesOwnTLSToTheNameLookedUpAgain(t *testing.T) {
+	ge := newGrantEnv(t)
+	ge.grants.set("example.com", passGrant())
+	status, body, _ := do(t, ge.passClient(), "GET", "https://example.com/", nil)
+	if status != http.StatusOK || body != "from the granted upstream" {
+		t.Fatalf("response = %d %q", status, body)
+	}
+	rec := ge.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindPassthrough })
+	if rec.Verdict != audit.Allow || rec.Grant != "gr-pass" || rec.Name != "example.com" || rec.Treatment != "passthrough" ||
+		!slices.Equal(rec.UpstreamAddress, []string{"203.0.113.5:443"}) || rec.BytesUp == 0 || rec.BytesDown == 0 ||
+		!strings.Contains(rec.Reason, "reads and writes") {
+		t.Errorf("record = %+v", rec)
+	}
+}
+
+func TestAPassthroughGrantToALoopbackAddressIsNotConnected(t *testing.T) {
+	ge := newGrantEnv(t)
+	ge.resolveTo("example.com", "127.0.0.1")
+	ge.grants.set("example.com", passGrant())
+	if _, err := ge.passClient().Get("https://example.com/"); err == nil {
+		t.Fatal("the request went through")
+	}
+	rec := ge.log.waitFor(t, func(r *audit.Record) bool { return r.Kind == audit.KindPassthrough })
+	if rec.Verdict != audit.Deny || !strings.Contains(rec.Error, string(direct.ReasonAddressLocal)) || !slices.Equal(rec.UpstreamAddress, []string{"127.0.0.1:443"}) {
+		t.Errorf("record = %+v", rec)
+	}
+	if ge.upstreamRequests() != 0 {
+		t.Error("the upstream was reached")
+	}
+}
+
+func TestAPassthroughGrantThatCannotBeRecordedIsNotConnected(t *testing.T) {
+	ge := newGrantEnv(t)
+	ge.grants.set("example.com", passGrant())
+	ge.log.mu.Lock()
+	ge.log.fail = true
+	ge.log.mu.Unlock()
+	if _, err := ge.passClient().Get("https://example.com/"); err == nil {
+		t.Fatal("the request went through")
+	}
+	if ge.upstreamRequests() != 0 {
+		t.Error("the upstream was reached")
 	}
 }
