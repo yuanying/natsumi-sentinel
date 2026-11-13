@@ -380,6 +380,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			Source:      src.name,
 			Routes:      watcher.Current,
 			Decider:     decider,
+			Connections: decider,
 			Minter:      minter,
 			Log:         log,
 			Upstream:    gm.Upstream(upstream),
@@ -413,6 +414,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		dns := dnsgate.New(dnsgate.Config{
 			Source:   src.name,
 			Routes:   watcher.Current,
+			Names:    decider,
 			Resolver: net.DefaultResolver,
 			Fixed:    fixed,
 			Log:      log,
