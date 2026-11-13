@@ -29,7 +29,7 @@ LDFLAGS ?= -s -w -X main.version=$(VERSION)
 # containers in a Pod, on the same two architectures as the images.
 DIST_PLATFORMS ?= linux/amd64 linux/arm64
 # The packages with tests behind the netns build tag, and how to get root.
-NETNS_PKGS ?= ./internal/origdst ./internal/gate
+NETNS_PKGS ?= ./internal/origdst ./internal/gate ./internal/upstream
 SUDO ?= sudo
 
 ##@ General
