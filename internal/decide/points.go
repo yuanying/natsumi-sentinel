@@ -2,10 +2,12 @@ package decide
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"strings"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
+	"github.com/yuanying/natsumi-sentinel/internal/ledger"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
 
@@ -85,6 +87,14 @@ type NameAnswer struct {
 	Verdict   audit.Verdict
 	Treatment routes.Treatment
 	Reason    string
+	// Grant is the destination grant the name is answered on.
+	Grant string
+	// Remember is set for a refused name to keep on the list of refused
+	// names, for the owner to grant from (docs/adr/0008).
+	Remember bool
+	// Error is set when the decision could not be made as the ledger
+	// says: the name is refused.
+	Error string
 }
 
 // NameDecider decides on name resolution queries.
@@ -103,18 +113,28 @@ func (t Table) DecideName(ctx context.Context, q NameQuery) NameAnswer {
 	if q.Routes.Resolvable(name) {
 		return NameAnswer{Verdict: audit.Allow, Treatment: routes.Open, Reason: "an open destination in the routing table"}
 	}
-	// 3. The ledger's destination grants go here (docs/destination-grants.md).
+	// 3. A name a destination grant covers.
+	g, err := t.destinationGrant(ctx, q.Routes, q.Source, name)
+	if err != nil {
+		return NameAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: audit.ReasonDNSNotListed + "; " + reasonNoLedger, Error: err.Error()}
+	}
+	if g != nil {
+		return NameAnswer{Verdict: audit.Allow, Treatment: grantTreatment(g), Grant: g.ID, Reason: ReasonDNSGranted + ": " + g.ID}
+	}
 	// 4.
 	if j, ok := t.judge(ctx, Question{Point: PointName, Source: q.Source, Name: name}); ok {
 		return NameAnswer{Verdict: audit.Allow, Treatment: routes.Open, Reason: j.Reason}
 	}
 	// 5.
-	reason := audit.ReasonDNSNotListed
 	if searched(q.Routes, name, q.SearchSuffixes) {
-		reason = audit.ReasonDNSSearchSuffix
+		return NameAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: audit.ReasonDNSSearchSuffix}
 	}
-	return NameAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: reason}
+	return NameAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: audit.ReasonDNSNotListed, Remember: t.rememberable(q.Routes, name)}
 }
+
+// ReasonDNSGranted is the reason of a name answered on a destination
+// grant, followed by the grant's id.
+const ReasonDNSGranted = "a destination grant covers the name"
 
 // searched reports whether name is a name in table with one of the search
 // suffixes added.
@@ -157,6 +177,12 @@ type ConnectionAnswer struct {
 	// Destination is the open destination, when the connection is opened.
 	Destination routes.Destination
 	Reason      string
+	// Grant is the destination grant the connection is opened or passed
+	// through on.
+	Grant *ledger.Grant
+	// Error is set when the decision could not be made as the ledger
+	// says: the connection is refused.
+	Error string
 }
 
 // ConnectionDecider decides on connections.
@@ -184,7 +210,22 @@ func (t Table) DecideConnection(ctx context.Context, q ConnectionQuery) Connecti
 	if listed {
 		return ConnectionAnswer{Verdict: audit.Allow, Treatment: routes.Open, Destination: d, Reason: "an open destination in the routing table"}
 	}
-	// 3. The ledger's destination grants go here (docs/destination-grants.md).
+	// 3. A name a destination grant covers, on 443 only.
+	if !q.Routes.Listed(name) {
+		g, err := t.destinationGrant(ctx, q.Routes, q.Source, name)
+		switch {
+		case err != nil:
+			return ConnectionAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: "not in the routing table on this port; " + reasonNoLedger, Error: err.Error()}
+		case g != nil && q.Address.Port() != GrantPort:
+			return ConnectionAnswer{Verdict: audit.Deny, Treatment: routes.Closed, Reason: fmt.Sprintf("not in the routing table on this port; the destination grant %s covers port %d only", g.ID, GrantPort)}
+		case g != nil && g.Handling == ledger.Passthrough:
+			return ConnectionAnswer{Verdict: audit.Allow, Passthrough: true, Treatment: "passthrough", Grant: g,
+				Reason: fmt.Sprintf("the destination grant %s passes the name through unopened: reads and writes both go through, and what is in them is not seen", g.ID)}
+		case g != nil:
+			return ConnectionAnswer{Verdict: audit.Allow, Treatment: routes.Open, Destination: GrantedDestination(name), Grant: g,
+				Reason: fmt.Sprintf("the destination grant %s opens the name", g.ID)}
+		}
+	}
 	// 4. A judge cannot open a connection yet: an opened connection is
 	// for a destination of the table, whose requests are decided by its
 	// rules.

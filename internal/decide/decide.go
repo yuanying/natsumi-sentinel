@@ -43,6 +43,11 @@ type Request struct {
 	BodyComplete bool
 	// BodySummary is what the audit record keeps of Body.
 	BodySummary *audit.Body
+	// Granted is a request on a connection a destination grant opened:
+	// Destination is the one GrantedDestination makes, and Routes the
+	// routing table in use.
+	Granted bool
+	Routes  *routes.Table
 }
 
 // Operation is a request matched to a name.
@@ -142,10 +147,17 @@ type Table struct {
 	// Judge is step 4 (points.go). Nil, there is none, and what is left
 	// is asked about or refused.
 	Judge Judge
+	// Destinations are the destination grants (destination.go). Nil,
+	// there are none: a name not in the routing table is refused, and
+	// not remembered, as before they were.
+	Destinations *DestinationGrants
 }
 
 // Decide implements Decider.
 func (t Table) Decide(ctx context.Context, req Request) Decision {
+	if req.Granted {
+		return t.decideGranted(ctx, req)
+	}
 	d := req.Destination
 	var res Result
 	if d.GitHub != nil {
