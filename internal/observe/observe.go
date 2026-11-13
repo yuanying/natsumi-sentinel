@@ -83,6 +83,7 @@ func (r *Recorder) told(stage Stage, rec *audit.Record, err error) {
 		ev.Record.Request = &body
 	}
 	ev.Record.DNSAnswer = append([]string(nil), rec.DNSAnswer...)
+	ev.Record.UpstreamAddress = append([]string(nil), rec.UpstreamAddress...)
 	for _, t := range r.tell {
 		t(ev)
 	}

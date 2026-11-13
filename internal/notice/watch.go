@@ -112,6 +112,8 @@ var pairWords = map[string]string{
 	PairOperation:   "an operation",
 	PairPassthrough: "a passthrough",
 	PairDeniedName:  "a name refused in name resolution",
+
+	PairGrantedPassthrough: "a name a destination grant passes through",
 }
 
 func firstSeenNotice(rec *audit.Record, s audit.Seen) Notice {

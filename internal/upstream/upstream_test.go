@@ -421,3 +421,49 @@ func TestErrorsAreToldAsRefusalsOrFailures(t *testing.T) {
 		}
 	}
 }
+
+// Other forms carry an IPv4 address inside an IPv6 one: 6to4
+// (2002::/16, RFC 3056) and the old IPv4-compatible form (::/96). They are
+// taken as the IPv4 address they carry. The local-use NAT64 prefix
+// (64:ff9b:1::/48, RFC 8215) is the site's own translator, and private.
+// The discard prefix (100::/64) reaches no one.
+func TestIPv4CarriedInOtherIPv6FormsIsTakenAsTheIPv4Address(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want upstream.Reason
+	}{
+		{"2002:7f00:1::1", upstream.ReasonAddressLocal},
+		{"2002:a9fe:a9fe::1", upstream.ReasonAddressLocal},
+		{"::127.0.0.1", upstream.ReasonAddressLocal},
+		{"::169.254.169.254", upstream.ReasonAddressLocal},
+		{"100::1", upstream.ReasonAddressLocal},
+		{"2002:a01:203::1", upstream.ReasonAddressPrivate},
+		{"2002:c0a8:101::1", upstream.ReasonAddressPrivate},
+		{"::10.0.0.1", upstream.ReasonAddressPrivate},
+		{"64:ff9b:1::a01:203", upstream.ReasonAddressPrivate},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			e := newEnv(t, map[string][]string{"example.com": {tc.addr}}, "inside.example")
+			_, _, err := e.get(t, "https://example.com/", nil)
+			if got := reason(t, err); got != tc.want {
+				t.Errorf("reason = %s, want %s", got, tc.want)
+			}
+			if len(e.dials()) != 0 {
+				t.Errorf("dialed %v", e.dials())
+			}
+		})
+	}
+}
+
+func TestA6to4AddressCarryingAPublicIPv4AddressIsPublic(t *testing.T) {
+	// 2002:c000:20a:: carries 192.0.2.10.
+	e := newEnv(t, map[string][]string{"example.com": {"2002:c000:20a::1"}})
+	resp, rep, err := e.get(t, "https://example.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if rep.Address != netip.MustParseAddrPort("[2002:c000:20a::1]:443") {
+		t.Errorf("address = %s", rep.Address)
+	}
+}

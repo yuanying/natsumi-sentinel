@@ -53,6 +53,10 @@ type Config struct {
 	Minter      *certs.Minter
 	Log         Recorder
 	Upstream    http.RoundTripper
+	// Direct is the gate's own sending (internal/upstream), for what a
+	// destination grant lets through: it never goes to authd
+	// (docs/adr/0007, 0008). Nil, and nothing a grant covers is sent.
+	Direct DirectSender
 	// OriginalDst finds where a connection was going.
 	OriginalDst func(net.Conn) (netip.AddrPort, error)
 	// Dial connects a passthrough. Defaults to a net.Dialer.
@@ -255,8 +259,9 @@ func (g *Gate) plain(pc *peekConn, dst netip.AddrPort) {
 }
 
 var (
-	errNoSNI     = errors.New("no SNI")
-	errNotOpened = errors.New("not opened")
+	errNoSNI       = errors.New("no SNI")
+	errNotOpened   = errors.New("not opened")
+	errPassthrough = errors.New("passed through by a destination grant")
 )
 
 // terminateTLS terminates TLS for an open destination with a certificate
@@ -266,6 +271,9 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 		sni string
 		ans decide.ConnectionAnswer
 	)
+	// The handshake is kept as it is read, so that a connection a
+	// destination grant passes through can be handed on from its start.
+	hc := &helloConn{Conn: pc, keep: true}
 	conf := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -276,6 +284,13 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 			ans = g.cfg.Connections.DecideConnection(hello.Context(), decide.ConnectionQuery{Source: g.cfg.Source, Routes: table, Address: dst, Name: sni})
 			if ans.Verdict != audit.Allow {
 				return nil, errNotOpened
+			}
+			if ans.Passthrough {
+				// Nothing of the server's side of the handshake
+				// may reach the workspace: its TLS goes on with
+				// the upstream.
+				hc.mute = true
+				return nil, errPassthrough
 			}
 			cert, err := g.cfg.Minter.Certificate(sni)
 			if err != nil {
@@ -289,9 +304,16 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 			}, nil
 		},
 	}
-	tc := tls.Server(pc, conf)
+	tc := tls.Server(hc, conf)
 	_ = pc.SetDeadline(time.Now().Add(g.cfg.FirstByteTimeout))
 	err := tc.Handshake()
+	if errors.Is(err, errPassthrough) {
+		_ = pc.SetDeadline(time.Time{})
+		g.grantedPassthrough(pc, hc.kept.Bytes(), dst, sni, ans)
+		return
+	}
+	hc.keep = false
+	hc.kept.Reset()
 	if err != nil {
 		rec := g.base(audit.KindConnection, dst)
 		rec.Name = sni
@@ -300,6 +322,7 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 			g.refuseConn(rec, "TLS without SNI; the gate decides by name")
 		case errors.Is(err, errNotOpened):
 			rec.Treatment = string(ans.Treatment)
+			rec.Error = ans.Error
 			g.refuseConn(rec, ans.Reason)
 		default:
 			rec.Treatment = string(routes.Open)
@@ -310,7 +333,7 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 		return
 	}
 	_ = pc.SetDeadline(time.Time{})
-	if err := g.tlsc.push(&openConn{Conn: tc, sni: sni, dst: dst, dest: ans.Destination}); err != nil {
+	if err := g.tlsc.push(&openConn{Conn: tc, sni: sni, dst: dst, dest: ans.Destination, granted: ans.Grant != nil}); err != nil {
 		_ = tc.Close()
 	}
 }
@@ -322,6 +345,9 @@ type openConn struct {
 	sni  string
 	dst  netip.AddrPort
 	dest routes.Destination
+	// granted is a connection a destination grant opened: its requests
+	// are decided by the grant and sent by the gate itself.
+	granted bool
 
 	mu     sync.Mutex
 	served bool

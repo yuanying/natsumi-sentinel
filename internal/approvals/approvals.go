@@ -48,6 +48,8 @@ type OwnerConfig struct {
 	// each revocation with its time (docs/notices.md). Either may be nil.
 	Answered func(*ledger.Approval)
 	Revoked  func(g *ledger.Grant, at time.Time)
+	// Destinations turn the destination grants on. Nil leaves them off.
+	Destinations *DestinationConfig
 }
 
 // maxBody bounds what the doors read of a request body.
@@ -71,6 +73,10 @@ func Owner(cfg OwnerConfig) http.Handler {
 	mux.HandleFunc("GET /v1/events", o.events)
 	mux.HandleFunc("GET /v1/records", o.listRecords)
 	mux.HandleFunc("GET /v1/records/{id}", o.getRecord)
+	if cfg.Destinations != nil {
+		mux.HandleFunc("GET /v1/refused-names", o.listRefused)
+		mux.HandleFunc("POST /v1/refused-names/grant", o.grantRefused)
+	}
 	mux.HandleFunc("/", notFound)
 	return mux
 }
@@ -116,8 +122,9 @@ func (o *owner) getApproval(w http.ResponseWriter, r *http.Request) {
 }
 
 type answerBody struct {
-	Answer string `json:"answer"`
-	Choice string `json:"choice"`
+	Answer  string               `json:"answer"`
+	Choice  string               `json:"choice"`
+	Options *ledger.OptionAnswer `json:"options"`
 }
 
 func (o *owner) answer(w http.ResponseWriter, r *http.Request) {
@@ -133,8 +140,12 @@ func (o *owner) answer(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "choice: allowing takes one of the approval's choices")
 			return
 		}
-		ans = ledger.Answer{Allow: true, Choice: body.Choice}
+		ans = ledger.Answer{Allow: true, Choice: body.Choice, Options: body.Options}
 	case "deny":
+		if body.Options != nil {
+			writeError(w, http.StatusBadRequest, "options: only an answer that allows takes options")
+			return
+		}
 		ans = ledger.Answer{}
 	default:
 		writeError(w, http.StatusBadRequest, "answer is allow or deny")
@@ -171,6 +182,9 @@ func answerRecord(a *ledger.Approval, now time.Time) *audit.Record {
 			}
 		}
 		rec.Reason = fmt.Sprintf("the owner allowed %s with the choice %s", a.ID, label)
+		if a.Chosen != nil {
+			rec.Reason += " and the options " + optionsText(*a.Chosen)
+		}
 	} else {
 		rec.Verdict = audit.Deny
 		rec.Reason = fmt.Sprintf("the owner denied %s", a.ID)
@@ -196,7 +210,7 @@ func (o *owner) revoke(w http.ResponseWriter, r *http.Request) {
 		revoked, at = g, o.cfg.Now()
 		return o.cfg.Log.Write(context.WithoutCancel(r.Context()), &audit.Record{
 			Time: at, Source: g.Source, Kind: audit.KindAnswer, Verdict: audit.Deny,
-			Name: g.Destination, Operation: g.Operation, Target: g.Target, Method: g.Method, Path: g.Path,
+			Name: grantName(g), Operation: g.Operation, Target: g.Target, Method: g.Method, Path: g.Path,
 			Approval: g.Approval, Grant: g.ID,
 			Reason: fmt.Sprintf("the owner revoked %s (%s)", g.ID, g.Summary),
 		})
@@ -209,6 +223,15 @@ func (o *owner) revoke(w http.ResponseWriter, r *http.Request) {
 		o.cfg.Revoked(revoked, at)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": revoked})
+}
+
+// grantName is the name a grant is for: an operation grant's destination,
+// or a destination grant's name or domain.
+func grantName(g *ledger.Grant) string {
+	if g.Kind == ledger.GrantDestination {
+		return g.Name
+	}
+	return g.Destination
 }
 
 func (o *owner) events(w http.ResponseWriter, r *http.Request) {
@@ -309,6 +332,8 @@ type AgentConfig struct {
 	// Refusals is how far back the recent refusals go. Defaults to a day.
 	Refusals time.Duration
 	Now      func() time.Time
+	// Destinations turn the destination grants on. Nil leaves them off.
+	Destinations *DestinationConfig
 }
 
 // maxItems bounds one request beforehand.
@@ -374,11 +399,24 @@ func (a *agent) status(w http.ResponseWriter, r *http.Request) {
 			Operation: rec.Operation, Target: rec.Target, Approval: rec.Approval, Reason: rec.Reason,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"approvals": nonNil(pending),
 		"grants":    nonNil(grants),
 		"refused":   refused,
-	})
+	}
+	if dc := a.cfg.Destinations; dc != nil {
+		names, err := dc.refusedList(ctx, a.cfg.Ledger, ledger.RefusedFilter{Source: a.cfg.Source, Since: a.cfg.Now().Add(-a.cfg.Refusals)}, 20)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "the ledger could not be read")
+			return
+		}
+		recent := []refusedRecent{}
+		for _, n := range names {
+			recent = append(recent, refusedRecent{Name: n.Name, Last: n.Last, Count: n.Count})
+		}
+		out["refusedNames"] = recent
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *agent) getApproval(w http.ResponseWriter, r *http.Request) {
@@ -415,6 +453,22 @@ func (a *agent) ask(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(body.Items) == 0 || len(body.Items) > maxItems {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("items: from 1 to %d operations", maxItems))
+		return
+	}
+	var dests, ops int
+	for _, it := range body.Items {
+		if it.Operation == "" && it.Params == nil {
+			dests++
+		} else {
+			ops++
+		}
+	}
+	switch {
+	case dests > 0 && ops > 0:
+		writeError(w, http.StatusBadRequest, "items: operations and destinations are asked for apart")
+		return
+	case dests > 0:
+		a.askDestinations(w, r, body.Items)
 		return
 	}
 	table := a.cfg.Routes()

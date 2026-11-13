@@ -26,7 +26,7 @@ func ParseDomains(names []string) (Domains, error) {
 	var d Domains
 	for _, n := range names {
 		name := routes.Normalize(n)
-		if err := checkName(name); err != nil {
+		if err := CheckName(name); err != nil {
 			return Domains{}, fmt.Errorf("inside domain %q: %w", n, err)
 		}
 		d.names = append(d.names, name)
@@ -45,10 +45,10 @@ func (d Domains) Inside(name string) bool {
 	return false
 }
 
-// checkName holds name to the shape of a DNS name: dot separated labels
+// CheckName holds name to the shape of a DNS name: dot separated labels
 // of letters, digits, '-' and '_', none empty or longer than 63 bytes, at
 // most 253 bytes in all, and not an IP address.
-func checkName(name string) error {
+func CheckName(name string) error {
 	switch {
 	case name == "":
 		return errors.New("empty")

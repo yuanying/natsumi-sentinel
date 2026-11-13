@@ -20,6 +20,7 @@
 | `operation` | 開く宛先へ通した書きの要求（GET・HEAD・OPTIONS・TRACE 以外で、記録の `read` が偽のもの）で、操作の名前のあるもの | 名前・操作の名前・対象を空白でつないだもの（対象が無ければ名前と操作の名前） |
 | `write` | 開く宛先へ通した書きの要求で、生の操作のもの（操作の名前が無い） | 名前・method・path を空白でつないだもの |
 | `passthrough` | passthrough でつないだ接続 | 元の宛先の IP とポート |
+| `granted-passthrough` | 宛先の許しの passthrough でつないだ接続 | SNI の名前とポート（`名前:443`） |
 | `denied-name` | 名前解決で断った問い合わせ（`kind` が `dns`、`verdict` が `deny`）。振り分けにある名前に search の接尾辞を付けただけの問い合わせは除く（下） | 問い合わせた名前 |
 
 - 書きの組は、記録に操作の名前があれば操作と対象で、無ければ（生の操作）名前・method・path で取る。query はどちらにも入れない。

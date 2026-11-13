@@ -203,7 +203,7 @@
 
 ## 宛先の許し
 
-ADR-0008 で足すもので、まだ実装していない。台帳の中身と照合の決まりは [宛先の許し](destination-grants.md) にある。**ここに書くものは、今ある欄と口に足すだけで、今ある欄の意味と口の形は変えない。** 今の natsumi の承認の画面は、足した欄を知らなくても、今までどおり動く。
+ADR-0008 で足すもので、関所に `-destination-grants` を渡したときだけ働く（渡さなければ、下の口は無く、宛先の中身の先に頼む要求は 400 で断る）。台帳の中身と照合の決まりは [宛先の許し](destination-grants.md) にある。**ここに書くものは、今ある欄と口に足すだけで、今ある欄の意味と口の形は変えない。** 今の natsumi の承認の画面は、足した欄を知らなくても、今までどおり動く。
 
 ### 今ある形に足す欄
 
@@ -214,6 +214,7 @@ ADR-0008 で足すもので、まだ実装していない。台帳の中身と�
 | 許し | `kind` | `operation`（今ある許し）か `destination`（宛先の許し）。今ある許しにも付ける |
 | 許し | `name`・`unit`・`handling`・`access` | `kind` が `destination` のときだけ。[宛先の許し](destination-grants.md) の「台帳に足すもの」 |
 | 答えの要求の本文 | `options` | `kind` が `destination` の承認待ちに許すときだけ書ける。`{"unit", "handling", "access"}` で、どれも省ける（省けば既定）。ほかの承認待ちに書けば 400 |
+| 承認待ち | `chosen` | `kind` が `destination` の承認待ちに許したときだけ。選ばれた `options` の id（既定を埋めたもの） |
 | 自分の状態 | `refusedNames` | 最近 1 日に、自分の名前解決で断られた表に無い名前。新しい順に 20 件まで。1 つずつ `name`・`last`・`count` |
 
 - `kind` が `destination` の承認待ちの `choices` は、`durations` の順の `timed` だけで、`once` は無い。

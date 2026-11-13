@@ -51,6 +51,9 @@ const (
 	// KindBeforehand is a list of operations the workspace asked for
 	// before making the requests.
 	KindBeforehand Kind = "beforehand"
+	// KindDestination is a list of names not in the routing table the
+	// workspace asked for beforehand (docs/destination-grants.md).
+	KindDestination Kind = "destination"
 )
 
 // Scope is how far a grant reaches.
@@ -131,32 +134,52 @@ type Approval struct {
 	Summary string   `json:"summary"`
 	Items   []Facts  `json:"items"`
 	Choices []Choice `json:"choices"`
+	// Options are what else the owner chooses on an approval of
+	// destinations: how wide, how handled and what goes through.
+	Options *Options `json:"options,omitempty"`
 	// Requests counts how many times the same request was held on it.
 	Requests int `json:"requests"`
 
 	Answered *time.Time `json:"answered,omitempty"`
 	// Choice is the choice the owner allowed it with.
-	Choice string   `json:"choice,omitempty"`
-	Grants []string `json:"grants,omitempty"`
+	Choice string `json:"choice,omitempty"`
+	// Chosen are the options the owner allowed an approval of
+	// destinations with, the defaults filled in.
+	Chosen *OptionAnswer `json:"chosen,omitempty"`
+	Grants []string      `json:"grants,omitempty"`
 
 	fingerprint string
 }
 
 // Grant is what an allowed approval leaves in the ledger.
 type Grant struct {
-	ID       string     `json:"id"`
-	Approval string     `json:"approval"`
+	ID string `json:"id"`
+	// Kind is GrantOperation or GrantDestination.
+	Kind GrantKind `json:"kind"`
+	// Approval is empty for a destination grant given from the list of
+	// refused names.
+	Approval string     `json:"approval,omitempty"`
 	Source   string     `json:"source"`
 	Scope    Scope      `json:"scope"`
 	Created  time.Time  `json:"created"`
 	Expires  *time.Time `json:"expires,omitempty"`
 	Summary  string     `json:"summary"`
 
-	Destination string `json:"destination"`
+	// Destination, Operation, Target, Method and Path are an operation
+	// grant's.
+	Destination string `json:"destination,omitempty"`
 	Operation   string `json:"operation,omitempty"`
 	Target      string `json:"target,omitempty"`
 	Method      string `json:"method,omitempty"`
 	Path        string `json:"path,omitempty"`
+
+	// Name, Unit, Handling and Access are a destination grant's. Name is
+	// the domain when Unit is UnitDomain; Access is empty for a
+	// passthrough.
+	Name     string   `json:"name,omitempty"`
+	Unit     Unit     `json:"unit,omitempty"`
+	Handling Handling `json:"handling,omitempty"`
+	Access   Access   `json:"access,omitempty"`
 
 	fingerprint, opKey string
 }
@@ -166,12 +189,15 @@ type Answer struct {
 	Allow bool
 	// Choice is the ID of one of the approval's choices, when allowing.
 	Choice string
+	// Options are the ids of the options chosen, on an approval of
+	// destinations only. Nil, or an empty id, takes the first.
+	Options *OptionAnswer
 }
 
 var (
 	ErrNotFound  = errors.New("no such approval or grant")
 	ErrClosed    = errors.New("the approval is already closed")
-	ErrBadChoice = errors.New("the approval does not offer that choice")
+	ErrBadChoice = errors.New("the approval does not offer that choice or option")
 )
 
 // EventType says what happened to an approval.
@@ -193,13 +219,20 @@ type Ledger struct {
 	db  *sql.DB
 	now func() time.Time
 
+	// refusedMax is how many refused names are kept for one source, and
+	// refusedAge how long one is kept after it was last refused.
+	refusedMax int
+	refusedAge time.Duration
+
 	mu   sync.Mutex
 	subs map[chan Event]struct{}
 }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
-const schema = `
+// schemaV1 is the ledger as its first version had it. upgrades bring it up
+// to the version after each.
+const schemaV1 = `
 CREATE TABLE approvals (
 	id TEXT PRIMARY KEY,
 	state TEXT NOT NULL,
@@ -228,6 +261,28 @@ CREATE TABLE grants (
 CREATE INDEX grants_match ON grants (source, destination, operation);
 `
 
+// upgrades[i] brings a ledger of version i+1 up to i+2. Version 2 adds the
+// destination grants and the refused names (docs/destination-grants.md):
+// the grants a ledger of version 1 has are operation grants.
+var upgrades = []string{`
+ALTER TABLE grants ADD COLUMN kind TEXT NOT NULL DEFAULT 'operation';
+ALTER TABLE grants ADD COLUMN name TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN unit TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN handling TEXT NOT NULL DEFAULT '';
+ALTER TABLE grants ADD COLUMN access TEXT NOT NULL DEFAULT '';
+CREATE INDEX grants_destination ON grants (source, kind, name);
+CREATE TABLE refused_names (
+	source TEXT NOT NULL,
+	name TEXT NOT NULL,
+	domain TEXT NOT NULL,
+	first TEXT NOT NULL,
+	last TEXT NOT NULL,
+	count INTEGER NOT NULL,
+	PRIMARY KEY (source, name)
+) WITHOUT ROWID;
+CREATE INDEX refused_names_last ON refused_names (source, last);
+`}
+
 // Open opens the ledger at path, creating it if it does not exist. The
 // directory must exist, as for the audit log.
 func Open(path string, now func() time.Time) (*Ledger, error) {
@@ -244,21 +299,29 @@ func Open(path string, now func() time.Time) (*Ledger, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("read the ledger's version: %w", err)
 	}
-	switch v {
-	case schemaVersion:
-	case 0:
-		if _, err := db.Exec(schema + fmt.Sprintf("PRAGMA user_version = %d;", schemaVersion)); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("create the ledger: %w", err)
-		}
-	default:
+	if v > schemaVersion {
 		_ = db.Close()
 		return nil, fmt.Errorf("the ledger is version %d; this build knows %d", v, schemaVersion)
+	}
+	if v < schemaVersion {
+		stmts := ""
+		if v == 0 {
+			stmts, v = schemaV1, 1
+		}
+		for ; v < schemaVersion; v++ {
+			stmts += upgrades[v-1]
+		}
+		// One transaction: a ledger is brought up whole, or not at all.
+		if _, err := db.Exec("BEGIN;" + stmts + fmt.Sprintf("PRAGMA user_version = %d; COMMIT;", schemaVersion)); err != nil {
+			_, _ = db.Exec("ROLLBACK")
+			_ = db.Close()
+			return nil, fmt.Errorf("bring the ledger up to version %d: %w", schemaVersion, err)
+		}
 	}
 	if now == nil {
 		now = time.Now
 	}
-	return &Ledger{db: db, now: now, subs: map[chan Event]struct{}{}}, nil
+	return &Ledger{db: db, now: now, subs: map[chan Event]struct{}{}, refusedMax: RefusedMax, refusedAge: RefusedAge}, nil
 }
 
 // Close closes the file.
@@ -381,7 +444,7 @@ func findGrant(ctx context.Context, tx *sql.Tx, f Facts, now string, taken []str
 	// Grants for one request go first, so a timed grant is not what a
 	// once grant is left over for.
 	row := tx.QueryRowContext(ctx, `SELECT doc, scope FROM grants
-		WHERE source = ? AND destination = ? AND (expires IS NULL OR expires > ?) AND (`+cond+`)`+notTaken+`
+		WHERE kind = 'operation' AND source = ? AND destination = ? AND (expires IS NULL OR expires > ?) AND (`+cond+`)`+notTaken+`
 		ORDER BY scope = 'once' DESC, created LIMIT 1`,
 		append([]any{f.Source, f.Destination, now}, args...)...)
 	var doc, scope string
@@ -391,11 +454,11 @@ func findGrant(ctx context.Context, tx *sql.Tx, f Facts, now string, taken []str
 		}
 		return nil, "", fmt.Errorf("read the ledger: %w", err)
 	}
-	var g Grant
-	if err := json.Unmarshal([]byte(doc), &g); err != nil {
-		return nil, "", fmt.Errorf("read the ledger: %w", err)
+	g, err := decodeGrant(doc)
+	if err != nil {
+		return nil, "", err
 	}
-	return &g, Scope(scope), nil
+	return g, Scope(scope), nil
 }
 
 // Hold makes an approval of the request in f, or, when the same request
@@ -557,9 +620,17 @@ func (l *Ledger) Answer(ctx context.Context, id string, ans Answer, record func(
 		return nil, ErrClosed
 	}
 	a.Answered = &now
-	if !ans.Allow {
+	if ans.Options != nil && a.Kind != KindDestination {
+		return nil, ErrBadChoice
+	}
+	switch {
+	case !ans.Allow:
 		a.State = Denied
-	} else {
+	case a.Kind == KindDestination:
+		if err := l.allowDestinations(ctx, tx, a, ans, now); err != nil {
+			return nil, err
+		}
+	default:
 		var choice *Choice
 		for i := range a.Choices {
 			if a.Choices[i].ID == ans.Choice {
@@ -690,9 +761,9 @@ func (l *Ledger) grants(ctx context.Context, source string) ([]*Grant, error) {
 		if err := rows.Scan(&doc); err != nil {
 			return nil, fmt.Errorf("read the ledger: %w", err)
 		}
-		g := &Grant{}
-		if err := json.Unmarshal([]byte(doc), g); err != nil {
-			return nil, fmt.Errorf("read the ledger: %w", err)
+		g, err := decodeGrant(doc)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, g)
 	}
@@ -715,9 +786,9 @@ func (l *Ledger) Revoke(ctx context.Context, id string, record func(*Grant) erro
 	if err != nil {
 		return fmt.Errorf("read the ledger: %w", err)
 	}
-	g := &Grant{}
-	if err := json.Unmarshal([]byte(doc), g); err != nil {
-		return fmt.Errorf("read the ledger: %w", err)
+	g, err := decodeGrant(doc)
+	if err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM grants WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("write the ledger: %w", err)
@@ -764,6 +835,9 @@ func (l *Ledger) Sweep(ctx context.Context) error {
 		l.tell(EventClosed, a)
 	}
 	if _, err := l.db.ExecContext(ctx, `DELETE FROM grants WHERE expires IS NOT NULL AND expires <= ?`, now); err != nil {
+		return fmt.Errorf("write the ledger: %w", err)
+	}
+	if _, err := l.db.ExecContext(ctx, `DELETE FROM refused_names WHERE last <= ?`, formatTime(l.now().Add(-l.refusedAge))); err != nil {
 		return fmt.Errorf("write the ledger: %w", err)
 	}
 	return nil
@@ -830,9 +904,23 @@ func getApproval(ctx context.Context, db execer, id string) (*Approval, error) {
 	return a, nil
 }
 
+// decodeGrant reads a grant as it is kept. A grant kept by the first
+// version of the ledger has no kind: it is an operation grant.
+func decodeGrant(doc string) (*Grant, error) {
+	g := &Grant{}
+	if err := json.Unmarshal([]byte(doc), g); err != nil {
+		return nil, fmt.Errorf("read the ledger: %w", err)
+	}
+	if g.Kind == "" {
+		g.Kind = GrantOperation
+	}
+	return g, nil
+}
+
 func newGrant(a *Approval, f Facts, c Choice, now time.Time) *Grant {
 	g := &Grant{
 		ID:          newID("gr-"),
+		Kind:        GrantOperation,
 		Approval:    a.ID,
 		Source:      a.Source,
 		Scope:       c.Scope,
@@ -873,9 +961,11 @@ func insertGrant(ctx context.Context, db execer, g *Grant) error {
 	if g.Expires != nil {
 		expires = formatTime(*g.Expires)
 	}
-	_, err = db.ExecContext(ctx, `INSERT INTO grants (id, source, scope, destination, operation, target, method, path, fingerprint, op_key, expires, created, doc)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		g.ID, g.Source, string(g.Scope), g.Destination, g.Operation, g.Target, g.Method, g.Path, g.fingerprint, g.opKey, expires, formatTime(g.Created), string(doc))
+	_, err = db.ExecContext(ctx, `INSERT INTO grants (id, kind, source, scope, destination, operation, target, method, path, fingerprint, op_key,
+		name, unit, handling, access, expires, created, doc)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		g.ID, string(g.Kind), g.Source, string(g.Scope), g.Destination, g.Operation, g.Target, g.Method, g.Path, g.fingerprint, g.opKey,
+		g.Name, string(g.Unit), string(g.Handling), string(g.Access), expires, formatTime(g.Created), string(doc))
 	if err != nil {
 		return fmt.Errorf("write the ledger: %w", err)
 	}

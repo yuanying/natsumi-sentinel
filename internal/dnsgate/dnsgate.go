@@ -39,6 +39,12 @@ type Recorder interface {
 	Write(ctx context.Context, rec *audit.Record) error
 }
 
+// RefusedKeeper remembers the names refused for the owner to grant from
+// (docs/adr/0008). The ledger is one.
+type RefusedKeeper interface {
+	RememberRefused(ctx context.Context, source, name string) (dropped int, err error)
+}
+
 // Config is what a Server needs.
 type Config struct {
 	Source string
@@ -67,6 +73,13 @@ type Config struct {
 	// IPv4 is. Only then are open names answered in AAAA, with their real
 	// IPv6 addresses, and a name with no IPv4 address is told to be there.
 	IPv6 bool
+	// Refused remembers the refused names the decision says to. Nil
+	// remembers none.
+	Refused RefusedKeeper
+	// Remembered is told each time a refused name is remembered: how many
+	// older names were dropped for it, or why it could not be. Nil tells
+	// no one.
+	Remembered func(dropped int, err error)
 }
 
 // Server answers queries.
@@ -216,7 +229,11 @@ func (s *Server) resolve(ctx context.Context, rec *audit.Record, name string, ty
 	})
 	rec.Treatment = string(ans.Treatment)
 	rec.Verdict, rec.Reason = ans.Verdict, ans.Reason
+	rec.Grant, rec.Error = ans.Grant, ans.Error
 	if ans.Verdict != audit.Allow {
+		if ans.Remember {
+			s.remember(ctx, rec, name)
+		}
 		return dnsmessage.RCodeNameError, nil
 	}
 	var network, other string
@@ -243,6 +260,22 @@ func (s *Server) resolve(ctx context.Context, rec *audit.Record, name string, ty
 		return rcode, nil
 	}
 	return dnsmessage.RCodeNameError, nil
+}
+
+// remember keeps a refused name for the owner. It is a convenience, not a
+// guard: a name that cannot be kept is refused all the same, and the
+// failure is in the record (docs/adr/0008 "倒す向き").
+func (s *Server) remember(ctx context.Context, rec *audit.Record, name string) {
+	if s.cfg.Refused == nil {
+		return
+	}
+	dropped, err := s.cfg.Refused.RememberRefused(ctx, s.cfg.Source, name)
+	if err != nil {
+		rec.Error = "the refused name could not be remembered: " + err.Error()
+	}
+	if s.cfg.Remembered != nil {
+		s.cfg.Remembered(dropped, err)
+	}
 }
 
 // lookup asks the real DNS for name's addresses of one family ("ip4" or

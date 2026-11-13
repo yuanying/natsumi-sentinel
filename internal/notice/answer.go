@@ -28,14 +28,20 @@ func Answered(a *ledger.Approval) Notice {
 
 	var b strings.Builder
 	held := "a request held"
-	if a.Kind == ledger.KindBeforehand {
+	switch a.Kind {
+	case ledger.KindBeforehand:
 		held = "operations asked for beforehand"
+	case ledger.KindDestination:
+		held = "destinations asked for beforehand"
 	}
 	fmt.Fprintf(&b, "The owner %s %s, %s for %s, at %s.", word, a.ID, held, a.Source, stamp(at))
 	if a.State == ledger.Allowed {
 		for _, c := range a.Choices {
 			if c.ID == a.Choice {
 				scope := scopeText(c, at)
+				if o := a.Chosen; o != nil {
+					scope += ", " + optionsText(o.Unit, o.Handling, o.Access)
+				}
 				summary += "; " + scope
 				fmt.Fprintf(&b, " The choice %s: %s.", c.ID, scope)
 			}
@@ -61,9 +67,56 @@ func Answered(a *ledger.Approval) Notice {
 	}
 }
 
+// GrantedFromList is the notice of the owner granting a name from the list
+// of refused names, at the time given: an answer without an approval.
+func GrantedFromList(g *ledger.Grant, at time.Time) Notice {
+	what := grantText(g)
+	return Notice{
+		Type: TypeAnswer,
+		At:   at,
+		Labels: map[string]string{
+			"answer":   string(ledger.Allowed),
+			"approval": "",
+			"grant":    g.ID,
+			"source":   g.Source,
+		},
+		Summary: clip(fmt.Sprintf("The owner granted %s from the list of refused names: %s", g.ID, what), maxLabel),
+		Description: clip(fmt.Sprintf("The owner gave the destination grant %s from the list of refused names, for %s, at %s, %s: %s.",
+			g.ID, g.Source, stamp(at), endText(g), what), maxDescription),
+	}
+}
+
+// grantText tells what a grant covers: an operation grant's operation and
+// target, or a destination grant's name and options.
+func grantText(g *ledger.Grant) string {
+	if g.Kind != ledger.GrantDestination {
+		return operationOn(g.Destination, g.Operation, g.Target, g.Method, g.Path)
+	}
+	unit := "name"
+	if g.Unit == ledger.UnitDomain {
+		unit = "domain:" + g.Name
+	}
+	return "the destination " + g.Name + " (" + optionsText(unit, string(g.Handling), string(g.Access)) + ")"
+}
+
+func optionsText(unit, handling, access string) string {
+	s := "unit=" + unit + " handling=" + handling
+	if access != "" {
+		s += " access=" + access
+	}
+	return s
+}
+
+func endText(g *ledger.Grant) string {
+	if g.Expires == nil {
+		return "with no end"
+	}
+	return "ending at " + stamp(*g.Expires)
+}
+
 // Revoked is the notice of the owner revoking a grant, at the time given.
 func Revoked(g *ledger.Grant, at time.Time) Notice {
-	what := operationOn(g.Destination, g.Operation, g.Target, g.Method, g.Path)
+	what := grantText(g)
 	end := "with no end"
 	if g.Expires != nil {
 		end = "ending at " + stamp(*g.Expires)
@@ -84,6 +137,9 @@ func Revoked(g *ledger.Grant, at time.Time) Notice {
 }
 
 func factsText(f ledger.Facts) string {
+	if f.Operation == "" && f.Method == "" {
+		return "the destination " + f.Destination
+	}
 	return operationOn(f.Destination, f.Operation, f.TargetText, f.Method, f.Path)
 }
 

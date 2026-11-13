@@ -36,6 +36,10 @@
 | `sentinel_routes_reload_failures_total` | counter | なし | 振り分けを読み直して採れなかった数（前の振り分けのまま動いている） |
 | `sentinel_upstream_failures_total` | counter | `destination`・`reason` | 関所が通した要求で、上流の答えが得られなかった数 |
 | `sentinel_approvals_pending` | gauge | なし | 本人の答えを待っている承認待ちの数。台帳から、scrape のたびに数える |
+| `sentinel_destination_grants` | gauge | `handling`・`access` | 効いている宛先の許しの数（`-destination-grants` のときだけ）。台帳から、scrape のたびに数える |
+| `sentinel_refused_names` | gauge | なし | 覚えている断った名前の数（`-destination-grants` のときだけ） |
+| `sentinel_refused_names_dropped_total` | counter | なし | 上限で覚えから落とした断った名前の数 |
+| `sentinel_refused_names_unkept_total` | counter | なし | 覚えを書けなかった断った名前の数。名前は変わらず断った |
 | `sentinel_notices_total` | counter | `type`（`first-seen`・`answer`・`daily-summary`） | 作った知らせの数。送れたかどうかによらない |
 | `sentinel_notice_send_failures_total` | counter | なし | 待っている知らせを送ろうとして送れなかった回数。送り直す |
 | `sentinel_notices_pending` | gauge | なし | 送るのを待っている知らせの数 |
@@ -69,6 +73,7 @@
 | 値 | 中身 |
 |---|---|
 | authd の理由の名前（`upstream-not-registered`・`surrogate-mismatch`・`credential-unavailable`・`bad-request`・`upstream-unreachable`・`upstream-certificate`・`upstream-failed`） | authd が断った、または上流に届かなかった。意味は [関所と authd の間の形](authd-protocol.md) の「断りと失敗の形」 |
+| 関所の理由の名前（`upstream-address-local`・`upstream-address-private`・`surrogate-unswapped`・`upstream-port`・`upstream-not-https`、と失敗の 3 つ） | 関所が直に送る宛先の許しの要求・接続を、関所が断った、または上流に届かなかった。`destination` は `(not-listed)`。意味は [宛先の許し](destination-grants.md) の「呼び手に返すもの」 |
 | `other` | この版が知らない理由を authd が返した |
 | `authd-unreachable` | authd につなげなかった、または authd とのやりとりが壊れた |
 

@@ -149,6 +149,11 @@ type Record struct {
 	// AuthdReason is the reason authd gave for not handing back an
 	// upstream's response (docs/authd-protocol.md).
 	AuthdReason string `json:"authdReason,omitempty"`
+	// UpstreamAddress is where the gate connected when it sent upstream
+	// itself (ip:port), or, when it refused to connect by the addresses
+	// the name was looked up to, each of those (docs/destination-grants.md
+	// "記録に足すもの"). Empty for what authd sends.
+	UpstreamAddress []string `json:"upstreamAddress,omitempty"`
 
 	// Finished is false between Begin and Finish: a record that stays
 	// unfinished was cut off (the gate stopped while it was in flight).
@@ -163,7 +168,7 @@ type Log struct {
 	out io.Writer
 }
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 // schemaV1 is the table as its first version had it. Each later version
 // adds to it with the statements in upgrades.
@@ -211,6 +216,8 @@ var upgrades = []string{
 	// The requests recorded before are reads by their method alone.
 	`ALTER TABLE records ADD COLUMN read INTEGER NOT NULL DEFAULT 0;
 	UPDATE records SET read = 1 WHERE kind = 'http' AND method IN ('GET', 'HEAD', 'OPTIONS', 'TRACE');`,
+	// Where the gate itself connected; nothing before it did.
+	`ALTER TABLE records ADD COLUMN upstream_address TEXT NOT NULL DEFAULT '';`,
 }
 
 // Open opens the SQLite file at path, creating it if it does not exist, and
@@ -301,12 +308,12 @@ func (l *Log) Finish(ctx context.Context, rec *Record) error {
 		verdict = ?, reason = ?,
 		request_text = ?, request_size = ?, request_sha256 = ?, request_truncated = ?, request_binary = ?,
 		status = ?, response_bytes = ?, bytes_up = ?, bytes_down = ?, duration_ns = ?,
-		error = ?, authd_reason = ?, grant_id = ?, finished = 1
+		error = ?, authd_reason = ?, grant_id = ?, upstream_address = ?, finished = 1
 		WHERE id = ?`,
 		string(rec.Verdict), rec.Reason,
 		text, size, hash, trunc, bin,
 		rec.Status, rec.ResponseBytes, rec.BytesUp, rec.BytesDown, int64(rec.Duration),
-		rec.Error, rec.AuthdReason, rec.Grant, rec.ID)
+		rec.Error, rec.AuthdReason, rec.Grant, addressColumn(rec.UpstreamAddress), rec.ID)
 	if err != nil {
 		return fmt.Errorf("finish audit record %d: %w", rec.ID, err)
 	}
@@ -325,14 +332,14 @@ func (l *Log) insert(ctx context.Context, rec *Record) error {
 		request_text, request_size, request_sha256, request_truncated, request_binary,
 		status, response_bytes, bytes_up, bytes_down, duration_ns,
 		dns_type, dns_rcode, dns_answer, error, finished,
-		operation, target, approval, grant_id, authd_reason, read
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		operation, target, approval, grant_id, authd_reason, read, upstream_address
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		formatTime(rec.Time), rec.Source, string(rec.Kind), rec.Treatment, rec.Name, rec.Address,
 		rec.Method, rec.Path, rec.Query, string(rec.Verdict), rec.Reason,
 		text, size, hash, trunc, bin,
 		rec.Status, rec.ResponseBytes, rec.BytesUp, rec.BytesDown, int64(rec.Duration),
 		rec.DNSType, rec.DNSRcode, string(answer), rec.Error, rec.Finished,
-		rec.Operation, rec.Target, rec.Approval, rec.Grant, rec.AuthdReason, rec.Read)
+		rec.Operation, rec.Target, rec.Approval, rec.Grant, rec.AuthdReason, rec.Read, addressColumn(rec.UpstreamAddress))
 	if err != nil {
 		return fmt.Errorf("write audit record: %w", err)
 	}
@@ -375,7 +382,7 @@ const columns = `id, time, source, kind, treatment, name, address, method, path,
 	request_text, request_size, request_sha256, request_truncated, request_binary,
 	status, response_bytes, bytes_up, bytes_down, duration_ns,
 	dns_type, dns_rcode, dns_answer, error, finished,
-	operation, target, approval, grant_id, authd_reason, read`
+	operation, target, approval, grant_id, authd_reason, read, upstream_address`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -383,6 +390,7 @@ func scanRecord(row scanner) (*Record, error) {
 	var (
 		rec                      Record
 		t, kind, verdict, answer string
+		upstreamAddr             string
 		text, hash               sql.NullString
 		size, trunc, bin         sql.NullInt64
 		duration                 int64
@@ -393,9 +401,12 @@ func scanRecord(row scanner) (*Record, error) {
 		&text, &size, &hash, &trunc, &bin,
 		&rec.Status, &rec.ResponseBytes, &rec.BytesUp, &rec.BytesDown, &duration,
 		&rec.DNSType, &rec.DNSRcode, &answer, &rec.Error, &rec.Finished,
-		&rec.Operation, &rec.Target, &rec.Approval, &rec.Grant, &rec.AuthdReason, &rec.Read)
+		&rec.Operation, &rec.Target, &rec.Approval, &rec.Grant, &rec.AuthdReason, &rec.Read, &upstreamAddr)
 	if err != nil {
 		return nil, err
+	}
+	if upstreamAddr != "" {
+		rec.UpstreamAddress = strings.Split(upstreamAddr, " ")
 	}
 	if rec.Time, err = time.Parse(timeFormat, t); err != nil {
 		return nil, err
@@ -509,6 +520,9 @@ func bodyColumns(b *Body) (text, size, hash, trunc, bin any) {
 	}
 	return b.Text, b.Size, b.SHA256, b.Truncated, b.Binary
 }
+
+// addressColumn keeps addresses separated by spaces, which no address has.
+func addressColumn(addrs []string) string { return strings.Join(addrs, " ") }
 
 func nonNil(s []string) []string {
 	if s == nil {
