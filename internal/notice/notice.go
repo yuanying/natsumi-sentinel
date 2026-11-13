@@ -14,6 +14,8 @@ package notice
 
 import (
 	"net/http"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +63,9 @@ const (
 	PairPassthrough = "passthrough"
 	// PairDeniedName is a name refused in name resolution.
 	PairDeniedName = "denied-name"
+	// PairGrantedPassthrough is a name and port a destination grant
+	// passed straight through: by its name, since its addresses change.
+	PairGrantedPassthrough = "granted-passthrough"
 )
 
 // Pairs returns the pairs a record is, at its time and with its id. A
@@ -89,6 +94,12 @@ func Pairs(rec *audit.Record) []audit.Seen {
 			out = append(out, seen(PairWrite, rec.Name+" "+rec.Method+" "+rec.Path))
 		}
 		return out
+	case rec.Kind == audit.KindPassthrough && rec.Verdict == audit.Allow && rec.Grant != "":
+		port := "443"
+		if ap, err := netip.ParseAddrPort(rec.Address); err == nil {
+			port = strconv.Itoa(int(ap.Port()))
+		}
+		return []audit.Seen{seen(PairGrantedPassthrough, rec.Name+":"+port)}
 	case rec.Kind == audit.KindPassthrough && rec.Verdict == audit.Allow:
 		return []audit.Seen{seen(PairPassthrough, rec.Address)}
 	case rec.Kind == audit.KindDNS && rec.Verdict == audit.Deny && rec.Name != "" && rec.Reason != audit.ReasonDNSSearchSuffix:

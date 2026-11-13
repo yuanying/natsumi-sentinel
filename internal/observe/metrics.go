@@ -10,6 +10,7 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
 	"github.com/yuanying/natsumi-sentinel/internal/authdclient"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
+	"github.com/yuanying/natsumi-sentinel/internal/upstream"
 )
 
 // NotListed is the destination label of a name the routing table does not
@@ -48,7 +49,7 @@ func NewGateMetrics(reg prometheus.Registerer, table func() *routes.Table, fixed
 		}),
 		upstreamFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sentinel_upstream_failures_total",
-			Help: "Requests the gate allowed but could not get an upstream's answer for, by authd's reason, or authd-unreachable when authd itself could not be reached.",
+			Help: "Requests the gate allowed but could not get an upstream's answer for, by authd's reason, or authd-unreachable when authd itself could not be reached; and what the gate's own sending refused to send or could not get an answer for, by its reason.",
 		}, []string{"destination", "reason"}),
 	}
 	for _, name := range fixed {
@@ -129,6 +130,11 @@ func (c *countingTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 // failureReason is the label for a failure: authd's reason when it is one
 // this build knows, so that a newer authd cannot widen the label.
 func failureReason(err error) string {
+	var uerr *upstream.Error
+	if errors.As(err, &uerr) {
+		// The gate's own sending: its reasons are this build's.
+		return string(uerr.Reason)
+	}
 	var aerr *authdclient.Error
 	if !errors.As(err, &aerr) {
 		return "authd-unreachable"

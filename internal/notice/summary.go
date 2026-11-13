@@ -200,8 +200,13 @@ func (s *Summarizer) answerLine(a audit.Answer) string {
 	}
 	var head string
 	switch {
+	case a.Verdict == audit.Allow && a.Approval == "":
+		// A grant given from the list of refused names.
+		head = "allowed " + a.Grant
 	case a.Verdict == audit.Allow:
 		head = "allowed " + a.Approval
+	case a.Grant != "" && a.Approval == "":
+		head = "revoked " + a.Grant
 	case a.Grant != "":
 		head = "revoked " + a.Grant + " of " + a.Approval
 	default:
