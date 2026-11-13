@@ -46,6 +46,8 @@ import (
 	"github.com/yuanying/natsumi-sentinel/internal/origdst"
 	"github.com/yuanying/natsumi-sentinel/internal/peercred"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
+	// direct is the gate's own sending, apart from authd's (upstream).
+	direct "github.com/yuanying/natsumi-sentinel/internal/upstream"
 )
 
 const program = "sentinel"
@@ -134,9 +136,13 @@ type options struct {
 	sources                   sourceFlag
 	gateName, gateAddress     string
 	searchSuffixes            listFlag
-	reload                    time.Duration
-	metrics                   string
-	notices                   noticeOptions
+	// insideDomains and authdRegistration are for the gate's own sending
+	// (docs/destination-grants.md "関所が直に送る").
+	insideDomains     listFlag
+	authdRegistration string
+	reload            time.Duration
+	metrics           string
+	notices           noticeOptions
 }
 
 // noticeOptions are the settings of the notices (docs/notices.md). None of
@@ -177,6 +183,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.gateName, "gate-name", "", "the gate's own fixed name, answered in name resolution; the workspace's door is http://NAME/")
 	fs.StringVar(&o.gateAddress, "gate-address", "", "the IPv4 address -gate-name is answered with")
 	fs.Var(&o.searchSuffixes, "dns-search-suffix", "a search suffix of the workspace's resolver, such as svc.cluster.local; a refused name in the table with it added is recorded but not noticed; repeat for each")
+	fs.Var(&o.insideDomains, "inside-domain", "an inside domain: the names under it may be connected to private addresses when the gate sends upstream itself; repeat for each")
+	fs.StringVar(&o.authdRegistration, "authd-registration", "", "authd's registration, read for its surrogates only, so that the gate refuses to send one it does not swap; the keys it names are not read")
 	fs.DurationVar(&o.reload, "reload-interval", 10*time.Second, "how often the routing table is checked for changes")
 	fs.StringVar(&o.metrics, "metrics-listen", "", "the TCP address to serve the Prometheus metrics on, at /metrics; empty serves none")
 	fs.StringVar(&o.notices.alertmanager, "alertmanager-url", "", "Alertmanager's https base URL, reached through authd, to send the notices to; empty only logs them")
@@ -247,6 +255,9 @@ func (o *options) validate() (map[string]netip.Addr, error) {
 			return nil, fmt.Errorf("-dns-search-suffix %q is not a name", sfx)
 		}
 	}
+	if _, err := direct.ParseDomains(o.insideDomains); err != nil {
+		return nil, fmt.Errorf("-inside-domain: %w", err)
+	}
 	if (o.gateName == "") != (o.gateAddress == "") {
 		return nil, errors.New("-gate-name and -gate-address go together")
 	}
@@ -297,6 +308,16 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		return err
 	}
 	defer func() { _ = book.Close() }()
+	// The gate's own sending is not used yet: what it is given is read
+	// here, so that a setting it cannot use stops the gate now as it
+	// will then.
+	var surrogates direct.Surrogates
+	if o.authdRegistration != "" {
+		if surrogates, err = direct.LoadSurrogates(o.authdRegistration); err != nil {
+			return err
+		}
+	}
+	logger.Info("the gate's own sending is set up, and not used yet", "insideDomains", len(o.insideDomains), "surrogates", surrogates.Len())
 	upstream := newUpstream(o.authdSocket)
 
 	reg := metrics.NewRegistry(program, version)
@@ -380,6 +401,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 			Source:      src.name,
 			Routes:      watcher.Current,
 			Decider:     decider,
+			Connections: decider,
 			Minter:      minter,
 			Log:         log,
 			Upstream:    gm.Upstream(upstream),
@@ -413,6 +435,7 @@ func start(ctx context.Context, o options, fixed map[string]netip.Addr, stdout i
 		dns := dnsgate.New(dnsgate.Config{
 			Source:   src.name,
 			Routes:   watcher.Current,
+			Names:    decider,
 			Resolver: net.DefaultResolver,
 			Fixed:    fixed,
 			Log:      log,

@@ -43,11 +43,16 @@ type Config struct {
 	Source string
 	// Routes returns the routing table in use. It is asked once per
 	// connection, so a table read again applies to new connections.
-	Routes   func() *routes.Table
-	Decider  decide.Decider
-	Minter   *certs.Minter
-	Log      Recorder
-	Upstream http.RoundTripper
+	Routes func() *routes.Table
+	// Decider decides on requests, and Connections on connections, as
+	// they come in and at their TLS handshake (docs/adr/0008: one place
+	// decides for names, connections and requests). Connections defaults
+	// to a decide.Table without a ledger.
+	Decider     decide.Decider
+	Connections decide.ConnectionDecider
+	Minter      *certs.Minter
+	Log         Recorder
+	Upstream    http.RoundTripper
 	// OriginalDst finds where a connection was going.
 	OriginalDst func(net.Conn) (netip.AddrPort, error)
 	// Dial connects a passthrough. Defaults to a net.Dialer.
@@ -84,6 +89,9 @@ type Gate struct {
 
 // New makes a Gate. Serve starts it.
 func New(cfg Config) *Gate {
+	if cfg.Connections == nil {
+		cfg.Connections = decide.Table{}
+	}
 	if cfg.Dial == nil {
 		d := &net.Dialer{Timeout: 10 * time.Second}
 		cfg.Dial = d.DialContext
@@ -202,8 +210,8 @@ func (g *Gate) handle(c net.Conn) {
 		return
 	}
 	table := g.cfg.Routes()
-	if table.Passthrough(dst) {
-		g.passthrough(c, dst)
+	if ans := g.cfg.Connections.DecideConnection(context.Background(), decide.ConnectionQuery{Source: g.cfg.Source, Routes: table, Address: dst}); ans.Passthrough {
+		g.passthrough(c, dst, ans.Reason)
 		return
 	}
 
@@ -255,8 +263,8 @@ var (
 // made for its name, and hands the connection to the HTTP server.
 func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Table) {
 	var (
-		sni  string
-		dest routes.Destination
+		sni string
+		ans decide.ConnectionAnswer
 	)
 	conf := &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -265,11 +273,10 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 			if sni == "" {
 				return nil, errNoSNI
 			}
-			d, ok := table.Lookup(sni, dst.Port())
-			if !ok || d.Treatment != routes.Open {
+			ans = g.cfg.Connections.DecideConnection(hello.Context(), decide.ConnectionQuery{Source: g.cfg.Source, Routes: table, Address: dst, Name: sni})
+			if ans.Verdict != audit.Allow {
 				return nil, errNotOpened
 			}
-			dest = d
 			cert, err := g.cfg.Minter.Certificate(sni)
 			if err != nil {
 				return nil, err
@@ -292,12 +299,8 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 		case errors.Is(err, errNoSNI):
 			g.refuseConn(rec, "TLS without SNI; the gate decides by name")
 		case errors.Is(err, errNotOpened):
-			if d, ok := table.Lookup(sni, dst.Port()); ok {
-				rec.Treatment = string(d.Treatment)
-				g.refuseConn(rec, "the routing table denies this destination")
-			} else {
-				g.refuseConn(rec, "not in the routing table on this port")
-			}
+			rec.Treatment = string(ans.Treatment)
+			g.refuseConn(rec, ans.Reason)
 		default:
 			rec.Treatment = string(routes.Open)
 			rec.Error = err.Error()
@@ -307,7 +310,7 @@ func (g *Gate) terminateTLS(pc *peekConn, dst netip.AddrPort, table *routes.Tabl
 		return
 	}
 	_ = pc.SetDeadline(time.Time{})
-	if err := g.tlsc.push(&openConn{Conn: tc, sni: sni, dst: dst, dest: dest}); err != nil {
+	if err := g.tlsc.push(&openConn{Conn: tc, sni: sni, dst: dst, dest: ans.Destination}); err != nil {
 		_ = tc.Close()
 	}
 }

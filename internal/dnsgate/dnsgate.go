@@ -25,6 +25,7 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/yuanying/natsumi-sentinel/internal/audit"
+	"github.com/yuanying/natsumi-sentinel/internal/decide"
 	"github.com/yuanying/natsumi-sentinel/internal/routes"
 )
 
@@ -40,8 +41,12 @@ type Recorder interface {
 
 // Config is what a Server needs.
 type Config struct {
-	Source   string
-	Routes   func() *routes.Table
+	Source string
+	Routes func() *routes.Table
+	// Names decides which names are answered (docs/adr/0008: one place
+	// decides for names, connections and requests). Defaults to a
+	// decide.Table without a ledger.
+	Names    decide.NameDecider
 	Resolver Resolver
 	// Fixed are the gate's own names, answered with the address given.
 	Fixed  map[string]netip.Addr
@@ -68,8 +73,6 @@ type Config struct {
 type Server struct {
 	cfg   Config
 	fixed map[string]netip.Addr
-	// suffixes are the search suffixes, each with its leading dot.
-	suffixes []string
 }
 
 // New makes a Server.
@@ -86,28 +89,14 @@ func New(cfg Config) *Server {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 5 * time.Second
 	}
+	if cfg.Names == nil {
+		cfg.Names = decide.Table{}
+	}
 	fixed := map[string]netip.Addr{}
 	for name, addr := range cfg.Fixed {
 		fixed[routes.Normalize(name)] = addr
 	}
-	var suffixes []string
-	for _, sfx := range cfg.SearchSuffixes {
-		if sfx = strings.TrimPrefix(routes.Normalize(sfx), "."); sfx != "" {
-			suffixes = append(suffixes, "."+sfx)
-		}
-	}
-	return &Server{cfg: cfg, fixed: fixed, suffixes: suffixes}
-}
-
-// searched reports whether name is a name in table with one of the search
-// suffixes added.
-func (s *Server) searched(table *routes.Table, name string) bool {
-	for _, sfx := range s.suffixes {
-		if base, ok := strings.CutSuffix(name, sfx); ok && base != "" && table.Listed(base) {
-			return true
-		}
-	}
-	return false
+	return &Server{cfg: cfg, fixed: fixed}
 }
 
 // ServeUDP answers queries on pc until it is closed.
@@ -219,20 +208,17 @@ func (s *Server) resolve(ctx context.Context, rec *audit.Record, name string, ty
 		}
 		return dnsmessage.RCodeSuccess, nil
 	}
-	table := s.cfg.Routes()
-	if !table.Resolvable(name) {
-		rec.Treatment = string(routes.Closed)
-		rec.Verdict, rec.Reason = audit.Deny, audit.ReasonDNSNotListed
-		switch {
-		case table.Listed(name):
-			rec.Reason = audit.ReasonDNSDenied
-		case s.searched(table, name):
-			rec.Reason = audit.ReasonDNSSearchSuffix
-		}
+	ans := s.cfg.Names.DecideName(ctx, decide.NameQuery{
+		Source:         s.cfg.Source,
+		Routes:         s.cfg.Routes(),
+		Name:           name,
+		SearchSuffixes: s.cfg.SearchSuffixes,
+	})
+	rec.Treatment = string(ans.Treatment)
+	rec.Verdict, rec.Reason = ans.Verdict, ans.Reason
+	if ans.Verdict != audit.Allow {
 		return dnsmessage.RCodeNameError, nil
 	}
-	rec.Treatment = string(routes.Open)
-	rec.Verdict, rec.Reason = audit.Allow, "an open destination in the routing table"
 	var network, other string
 	switch {
 	case typ == dnsmessage.TypeA:

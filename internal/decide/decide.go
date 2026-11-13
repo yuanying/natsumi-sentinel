@@ -1,7 +1,9 @@
-// Package decide is where the gate decides whether a request read on an
-// open destination goes out (docs/adr/0004).
+// Package decide is where the gate decides what goes out: whether a name is
+// answered, whether a connection is opened or passed through, and whether a
+// request read on an open destination goes out (docs/adr/0004, 0008). The
+// three are decided by one Table, in one order of steps (points.go).
 //
-// The request is first matched to an operation: by the destination's
+// A request is first matched to an operation: by the destination's
 // connector, when it has one, or else by the destination's rules. A
 // request neither names is a raw operation. The table then says allow, ask
 // or deny for the operation; ask looks for a grant in the ledger and,
@@ -137,6 +139,9 @@ type Table struct {
 	// Without one, those requests are refused: the table says how they
 	// are named, and nothing here can read them.
 	GitHub Connector
+	// Judge is step 4 (points.go). Nil, there is none, and what is left
+	// is asked about or refused.
+	Judge Judge
 }
 
 // Decide implements Decider.
@@ -209,6 +214,8 @@ func (t Table) decide(ctx context.Context, req Request, ops []Operation) Decisio
 		asked   []Operation
 		allowed []string
 	)
+	// 1 and 2: what the table denies and allows. One operation denied
+	// denies the request.
 	for _, op := range ops {
 		what, from := describe(d, op)
 		switch d.ActionFor(op.Name) {
@@ -231,6 +238,7 @@ func (t Table) decide(ctx context.Context, req Request, ops []Operation) Decisio
 	if t.Ledger == nil {
 		return Decision{Verdict: audit.Deny, Reason: fmt.Sprintf("%s: %s asks about it, and there is no ledger", what, from), Error: "no ledger"}
 	}
+	// 3. The ledger's grants.
 	facts := make([]ledger.Facts, len(asked))
 	for i, op := range asked {
 		f := ledger.Facts{
@@ -270,6 +278,11 @@ func (t Table) decide(ctx context.Context, req Request, ops []Operation) Decisio
 	if len(without) == 0 {
 		return Decision{Verdict: audit.Allow, Grant: strings.Join(ids, ","), Reason: fmt.Sprintf("%s: %s asks about it, and the grant %s covers it", what, from, strings.Join(ids, ", "))}
 	}
+	// 4.
+	if j, ok := t.judge(ctx, Question{Point: PointRequest, Source: req.Source, Name: d.Name, Port: req.Port, Request: &req}); ok {
+		return Decision{Verdict: audit.Allow, Reason: j.Reason}
+	}
+	// 5. Held for the owner.
 	a, created, err := t.Ledger.HoldAll(ctx, without, req.Settings)
 	if err != nil {
 		return Decision{Verdict: audit.Deny, Reason: fmt.Sprintf("%s: %s asks about it, and the ledger could not hold it for the owner", what, from), Error: err.Error()}

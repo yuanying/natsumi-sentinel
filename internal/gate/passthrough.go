@@ -12,12 +12,12 @@ import (
 
 // passthrough connects c straight to its original destination without
 // reading it. The record holds where, how much and how long.
-func (g *Gate) passthrough(c net.Conn, dst netip.AddrPort) {
+func (g *Gate) passthrough(c net.Conn, dst netip.AddrPort, reason string) {
 	defer func() { _ = c.Close() }()
 	rec := g.base(audit.KindPassthrough, dst)
 	rec.Treatment = "passthrough"
 	rec.Verdict = audit.Allow
-	rec.Reason = "the address range and port are passed through"
+	rec.Reason = reason
 	ctx := context.Background()
 	if err := g.cfg.Log.Begin(ctx, rec); err != nil {
 		g.cfg.Logger.Error("a passthrough could not be recorded, so it was not connected", "address", rec.Address, "error", err)
